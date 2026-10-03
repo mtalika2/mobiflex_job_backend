@@ -1,0 +1,88 @@
+{
+  "id": "WW0swS2m2vOUrY9lZV3h",
+  "data": {
+    "paymentPlan": "12 months",
+    "incomeSource": "Business",
+    "paymentPlanDiscountPercent": 0,
+    "selfieStatus": "Ready",
+    "phone": "989216202",
+    "deposit": 100000,
+    "location": "Machinga",
+    "source": "MobiFlex Sell",
+    "idFrontStatus": "Ready",
+    "phoneModelId": "SAqt6WprZegZdPuzQ0xq",
+    "gender": "Male",
+    "totalRepayment": 680000,
+    "kycStatus": "Pending",
+    "secondaryPhone": "994756002",
+    "monthlyPayment": 52900,
+    "agentId": "IJYjTRX3EqSh6b3fCLq7rs3GCLj1",
+    "remainingAmount": 680000,
+    "customerName": "Noel Haji",
+    "weeklyPayment": 13500,
+    "homeAddress": "machinga",
+    "dailyPayment": 2000,
+    "distributionModel": "PosFin",
+    "loanAmount": 680000,
+    "fullName": "Noel Haji",
+    "cashPrice": 450000,
+    "proofOfAddressStatus": "Ready",
+    "idNumber": "0X28FYWK",
+    "applicationStatus": "Pending",
+    "dob": "2002-12-14",
+    "approvalStatus": "Pending",
+    "createdByAgentId": "IJYjTRX3EqSh6b3fCLq7rs3GCLj1",
+    "loanPeriodMonths": 12,
+    "applicationId": "WW0swS2m2vOUrY9lZV3h",
+    "requiredDeposit": 100000,
+    "incomeBand": "MWK 500,001 - 1,000,000",
+    "phoneModel": "Tecn spark Go 1",
+    "imei": "356505334823851",
+    "country": "Malawi",
+    "dateOfBirth": "2002-12-14",
+    "nationalId": "0X28FYWK",
+    "reviewStatus": "Pending",
+    "phoneSpec": "",
+    "idBackStatus": "Ready",
+    "paymentPlanDiscount": 0,
+    "submittedForReview": true,
+    "customerPhone": "989216202",
+    "incomeAmount": 500000,
+    "paymentStatus": "Pending",
+    "createdAt": {
+      "_seconds": 1788737328,
+      "_nanoseconds": 372000000
+    },
+    "reviewedAt": {
+      "_seconds": 1788737388,
+      "_nanoseconds": 155000000
+    },
+    "reviewedBy": "WQRnL6F2LkWjv0yrq4A9ZD1E7Pf1",
+    "approvedAt": {
+      "_seconds": 1788737388,
+      "_nanoseconds": 155000000
+    },
+    "reviewedByEmail": "noelmtalika35@gmail.com",
+    "status": "Approved",
+    "depositRemaining": 0,
+    "depositStatus": "Paid",
+    "depositPaid": 100000,
+    "deviceCheckedBy": "WQRnL6F2LkWjv0yrq4A9ZD1E7Pf1",
+    "lockStatus": "Unlocked",
+    "deviceCheckedAt": {
+      "_seconds": 1788737508,
+      "_nanoseconds": 116000000
+    },
+    "deviceCheckStatus": "Pending",
+    "deviceLockRequestedBy": "noelmtalika35@gmail.com",
+    "deviceLockRequestedAt": {
+      "_seconds": 1789401011,
+      "_nanoseconds": 656000000
+    },
+    "deviceStatus": "Locked",
+    "updatedAt": {
+      "_seconds": 1789401011,
+      "_nanoseconds": 656000000
+    }
+  }
+}

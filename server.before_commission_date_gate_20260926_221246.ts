@@ -1,0 +1,14028 @@
+import "dotenv/config";
+
+import express, {
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
+
+import cors from "cors";
+
+import crypto from "crypto";
+
+import nodemailer from "nodemailer";
+
+const nodeCronModule =
+  require("node-cron") as typeof import("node-cron");
+
+const nodeCron =
+  (nodeCronModule as any).default ?? nodeCronModule;
+
+import {
+  applicationDefault,
+  getApps,
+  initializeApp,
+} from "firebase-admin/app";
+
+import {
+  FieldValue,
+  Timestamp,
+  getFirestore,
+  type DocumentData,
+  type DocumentSnapshot,
+  type QueryDocumentSnapshot,
+} from "firebase-admin/firestore";
+
+import { getAuth } from "firebase-admin/auth";
+// ============================================================
+// MobiFlex African - Production Payment Backend
+// ============================================================
+//
+// Customer payment flow:
+// Customer App
+//   -> authenticated MobiFlex customer
+//   -> Paimport { createHash } from "crypto";yChangu mobile-money initialize
+//   -> Airtel Money / TNM Mpamba
+//   -> provider verification / webhook
+//   -> idempotent MobiFlex ledger
+//   -> application balance
+//   -> financing status
+//   -> device protection / UNLOCK command when fully paid
+//
+// Bank settlement is deliberately separate. Customer payments
+// are not automatically sent to a bank by this server.
+// ============================================================
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || "mobiflex-african";
+const MOBIFLEX_HOSTING_URL =
+  process.env.MOBIFLEX_HOSTING_URL ||
+  "https://mobiflex-african.web.app";
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || "";
+
+// ============================================================
+// PAYCHANGU
+// ============================================================
+
+const PAYCHANGU_BASE_URL =
+  (process.env.PAYCHANGU_BASE_URL || "https://api.paychangu.com").replace(
+    /\/+$/,
+    "",
+  );
+const PAYCHANGU_SECRET_KEY = process.env.PAYCHANGU_SECRET_KEY || "";
+const PAYCHANGU_WEBHOOK_SECRET =
+  process.env.PAYCHANGU_WEBHOOK_SECRET || "";
+
+const PAYCHANGU_AIRTEL_OPERATOR_REF_ID =
+  process.env.PAYCHANGU_AIRTEL_OPERATOR_REF_ID ||
+  "20be6c20-adeb-4b5b-a7ba-0769820df4fb";
+const PAYCHANGU_TNM_OPERATOR_REF_ID =
+  process.env.PAYCHANGU_TNM_OPERATOR_REF_ID ||
+  "27494cb5-ba9e-437f-a114-4e7a7686bcca";
+
+const PAYCHANGU_LIVE_ONLY =
+  String(process.env.PAYCHANGU_LIVE_ONLY ?? "true")
+    .trim()
+    .toLowerCase() === "true";
+
+const MANUAL_PAYMENT_CONFIRM_ENABLED =
+  String(process.env.MANUAL_PAYMENT_CONFIRM_ENABLED ?? "false")
+    .trim()
+    .toLowerCase() === "true";
+
+// ============================================================
+// APPLICATION WORKFLOW
+// ============================================================
+
+const APPLICATION_PENDING_TIMEOUT_MINUTES = Number(
+  process.env.APPLICATION_PENDING_TIMEOUT_MINUTES || 10,
+);
+const APPLICATION_PENDING_TIMEOUT_MS =
+  APPLICATION_PENDING_TIMEOUT_MINUTES * 60 * 1000;
+const DEFAULT_GRACE_PERIOD_DAYS = Number(
+  process.env.DEFAULT_GRACE_PERIOD_DAYS || 7,
+);
+
+type ApplicationWorkflowState =
+  | "PENDING"
+  | "APPROVED"
+  | "IMEI_VERIFIED"
+  | "CUSTOMER_VERIFIED"
+  | "DEVICE_INSTALLING"
+  | "DEVICE_READY"
+  | "AGREEMENT_SIGNED"
+  | "READY_FOR_DEPOSIT"
+  | "DEPOSIT_PENDING"
+  | "SALE_COMPLETE"
+  | "FINANCING_ACTIVE"
+  | "PAID_OFF"
+  | "EXPIRED"
+  | "REJECTED";
+
+const APPLICATION_TERMINAL_STATES = new Set<ApplicationWorkflowState>([
+  "PAID_OFF",
+  "EXPIRED",
+  "REJECTED",
+]);
+
+const PAYCHANGU_CHECKOUT_CALLBACK_URL =
+  process.env.PAYCHANGU_CHECKOUT_CALLBACK_URL || "";
+const PAYCHANGU_CHECKOUT_RETURN_URL =
+  process.env.PAYCHANGU_CHECKOUT_RETURN_URL || "";
+
+// ============================================================
+// FIREBASE
+// ============================================================
+
+if (getApps().length === 0) {
+  initializeApp({
+    credential: applicationDefault(),
+    projectId: PROJECT_ID,
+  });
+}
+
+const db = getFirestore();
+const auth = getAuth();
+
+// ============================================================
+// EMAIL
+// ============================================================
+
+const mailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.MAIL_USER,
+    pass: process.env.MAIL_APP_PASSWORD,
+  },
+});
+
+const MAIL_FROM =
+  `"${process.env.MAIL_FROM_NAME || "MobiFlex African"}" <${process.env.MAIL_USER}>`;
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+
+app.use(cors());
+app.use(
+  express.json({
+    limit: "5mb",
+    verify: (req, _res, buffer) => {
+      (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer);
+    },
+  }),
+);
+app.use(express.urlencoded({ extended: true }));
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function text(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+function numberValue(value: unknown): number {
+  if (typeof value === "number") return value;
+  if (typeof value === "string") return Number(value) || 0;
+  return 0;
+}
+
+function money(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function normalizeCountry(value: unknown): string {
+  const v = text(value).trim().toLowerCase();
+
+  const countries: Record<string, string> = {
+    af: "AF",
+    afghanistan: "AF",
+
+    al: "AL",
+    albania: "AL",
+
+    dz: "DZ",
+    algeria: "DZ",
+
+    ad: "AD",
+    andorra: "AD",
+
+    ao: "AO",
+    angola: "AO",
+
+    ag: "AG",
+    "antigua and barbuda": "AG",
+
+    ar: "AR",
+    argentina: "AR",
+
+    am: "AM",
+    armenia: "AM",
+
+    au: "AU",
+    australia: "AU",
+
+    at: "AT",
+    austria: "AT",
+
+    az: "AZ",
+    azerbaijan: "AZ",
+
+    bs: "BS",
+    bahamas: "BS",
+
+    bh: "BH",
+    bahrain: "BH",
+
+    bd: "BD",
+    bangladesh: "BD",
+
+    bb: "BB",
+    barbados: "BB",
+
+    by: "BY",
+    belarus: "BY",
+
+    be: "BE",
+    belgium: "BE",
+
+    bz: "BZ",
+    belize: "BZ",
+
+    bj: "BJ",
+    benin: "BJ",
+
+    bt: "BT",
+    bhutan: "BT",
+
+    bo: "BO",
+    bolivia: "BO",
+
+    ba: "BA",
+    "bosnia and herzegovina": "BA",
+
+    bw: "BW",
+    botswana: "BW",
+
+    br: "BR",
+    brazil: "BR",
+
+    bn: "BN",
+    brunei: "BN",
+
+    bg: "BG",
+    bulgaria: "BG",
+
+    bf: "BF",
+    "burkina faso": "BF",
+
+    bi: "BI",
+    burundi: "BI",
+
+    cv: "CV",
+    "cabo verde": "CV",
+
+    kh: "KH",
+    cambodia: "KH",
+
+    cm: "CM",
+    cameroon: "CM",
+
+    ca: "CA",
+    canada: "CA",
+
+    cf: "CF",
+    "central african republic": "CF",
+
+    td: "TD",
+    chad: "TD",
+
+    cl: "CL",
+    chile: "CL",
+
+    cn: "CN",
+    china: "CN",
+
+    co: "CO",
+    colombia: "CO",
+
+    km: "KM",
+    comoros: "KM",
+
+    cg: "CG",
+    congo: "CG",
+
+    cd: "CD",
+    "democratic republic of the congo": "CD",
+    "drc": "CD",
+
+    cr: "CR",
+    "costa rica": "CR",
+
+    ci: "CI",
+    "cote d'ivoire": "CI",
+    "cÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â´te d'ivoire": "CI",
+    "ivory coast": "CI",
+
+    hr: "HR",
+    croatia: "HR",
+
+    cu: "CU",
+    cuba: "CU",
+
+    cy: "CY",
+    cyprus: "CY",
+
+    cz: "CZ",
+    "czech republic": "CZ",
+    "czechia": "CZ",
+
+    dk: "DK",
+    denmark: "DK",
+
+    dj: "DJ",
+    djibouti: "DJ",
+
+    dm: "DM",
+    dominica: "DM",
+
+    do: "DO",
+    "dominican republic": "DO",
+
+    ec: "EC",
+    ecuador: "EC",
+
+    eg: "EG",
+    egypt: "EG",
+
+    sv: "SV",
+    "el salvador": "SV",
+
+    gq: "GQ",
+    "equatorial guinea": "GQ",
+
+    er: "ER",
+    eritrea: "ER",
+
+    ee: "EE",
+    estonia: "EE",
+
+    sz: "SZ",
+    eswatini: "SZ",
+
+    et: "ET",
+    ethiopia: "ET",
+
+    fj: "FJ",
+    fiji: "FJ",
+
+    fi: "FI",
+    finland: "FI",
+
+    fr: "FR",
+    france: "FR",
+
+    ga: "GA",
+    gabon: "GA",
+
+    gm: "GM",
+    gambia: "GM",
+
+    ge: "GE",
+    georgia: "GE",
+
+    de: "DE",
+    germany: "DE",
+
+    gh: "GH",
+    ghana: "GH",
+
+    gr: "GR",
+    greece: "GR",
+
+    gd: "GD",
+    grenada: "GD",
+
+    gt: "GT",
+    guatemala: "GT",
+
+    gn: "GN",
+    guinea: "GN",
+
+    gw: "GW",
+    "guinea-bissau": "GW",
+
+    gy: "GY",
+    guyana: "GY",
+
+    ht: "HT",
+    haiti: "HT",
+
+    hn: "HN",
+    honduras: "HN",
+
+    hu: "HU",
+    hungary: "HU",
+
+    is: "IS",
+    iceland: "IS",
+
+    in: "IN",
+    india: "IN",
+
+    id: "ID",
+    indonesia: "ID",
+
+    ir: "IR",
+    iran: "IR",
+
+    iq: "IQ",
+    iraq: "IQ",
+
+    ie: "IE",
+    ireland: "IE",
+
+    il: "IL",
+    israel: "IL",
+
+    it: "IT",
+    italy: "IT",
+
+    jm: "JM",
+    jamaica: "JM",
+
+    jp: "JP",
+    japan: "JP",
+
+    jo: "JO",
+    jordan: "JO",
+
+    kz: "KZ",
+    kazakhstan: "KZ",
+
+    ke: "KE",
+    kenya: "KE",
+
+    ki: "KI",
+    kiribati: "KI",
+
+    kp: "KP",
+    "north korea": "KP",
+
+    kr: "KR",
+    "south korea": "KR",
+
+    kw: "KW",
+    kuwait: "KW",
+
+    kg: "KG",
+    kyrgyzstan: "KG",
+
+    la: "LA",
+    laos: "LA",
+
+    lv: "LV",
+    latvia: "LV",
+
+    lb: "LB",
+    lebanon: "LB",
+
+    ls: "LS",
+    lesotho: "LS",
+
+    lr: "LR",
+    liberia: "LR",
+
+    ly: "LY",
+    libya: "LY",
+
+    li: "LI",
+    liechtenstein: "LI",
+
+    lt: "LT",
+    lithuania: "LT",
+
+    lu: "LU",
+    luxembourg: "LU",
+
+    mg: "MG",
+    madagascar: "MG",
+
+    mw: "MW",
+    malawi: "MW",
+
+    my: "MY",
+    malaysia: "MY",
+
+    mv: "MV",
+    maldives: "MV",
+
+    ml: "ML",
+    mali: "ML",
+
+    mt: "MT",
+    malta: "MT",
+
+    mh: "MH",
+    "marshall islands": "MH",
+
+    mr: "MR",
+    mauritania: "MR",
+
+    mu: "MU",
+    mauritius: "MU",
+
+    mx: "MX",
+    mexico: "MX",
+
+    fm: "FM",
+    micronesia: "FM",
+
+    md: "MD",
+    moldova: "MD",
+
+    mc: "MC",
+    monaco: "MC",
+
+    mn: "MN",
+    mongolia: "MN",
+
+    me: "ME",
+    montenegro: "ME",
+
+    ma: "MA",
+    morocco: "MA",
+
+    mz: "MZ",
+    mozambique: "MZ",
+
+    mm: "MM",
+    myanmar: "MM",
+
+    na: "NA",
+    namibia: "NA",
+
+    nr: "NR",
+    nauru: "NR",
+
+    np: "NP",
+    nepal: "NP",
+
+    nl: "NL",
+    netherlands: "NL",
+
+    nz: "NZ",
+    "new zealand": "NZ",
+
+    ni: "NI",
+    nicaragua: "NI",
+
+    ne: "NE",
+    niger: "NE",
+
+    ng: "NG",
+    nigeria: "NG",
+
+    mk: "MK",
+    "north macedonia": "MK",
+
+    no: "NO",
+    norway: "NO",
+
+    om: "OM",
+    oman: "OM",
+
+    pk: "PK",
+    pakistan: "PK",
+
+    pw: "PW",
+    palau: "PW",
+
+    ps: "PS",
+    palestine: "PS",
+
+    pa: "PA",
+    panama: "PA",
+
+    pg: "PG",
+    "papua new guinea": "PG",
+
+    py: "PY",
+    paraguay: "PY",
+
+    pe: "PE",
+    peru: "PE",
+
+    ph: "PH",
+    philippines: "PH",
+
+    pl: "PL",
+    poland: "PL",
+
+    pt: "PT",
+    portugal: "PT",
+
+    qa: "QA",
+    qatar: "QA",
+
+    ro: "RO",
+    romania: "RO",
+
+    ru: "RU",
+    russia: "RU",
+
+    rw: "RW",
+    rwanda: "RW",
+
+    kn: "KN",
+    "saint kitts and nevis": "KN",
+
+    lc: "LC",
+    "saint lucia": "LC",
+
+    vc: "VC",
+    "saint vincent and the grenadines": "VC",
+
+    ws: "WS",
+    samoa: "WS",
+
+    sm: "SM",
+    "san marino": "SM",
+
+    st: "ST",
+    "sao tome and principe": "ST",
+
+    sa: "SA",
+    "saudi arabia": "SA",
+
+    sn: "SN",
+    senegal: "SN",
+
+    rs: "RS",
+    serbia: "RS",
+
+    sc: "SC",
+    seychelles: "SC",
+
+    sl: "SL",
+    "sierra leone": "SL",
+
+    sg: "SG",
+    singapore: "SG",
+
+    sk: "SK",
+    slovakia: "SK",
+
+    si: "SI",
+    slovenia: "SI",
+
+    sb: "SB",
+    "solomon islands": "SB",
+
+    so: "SO",
+    somalia: "SO",
+
+    za: "ZA",
+    "south africa": "ZA",
+
+    ss: "SS",
+    "south sudan": "SS",
+
+    es: "ES",
+    spain: "ES",
+
+    lk: "LK",
+    "sri lanka": "LK",
+
+    sd: "SD",
+    sudan: "SD",
+
+    sr: "SR",
+    suriname: "SR",
+
+    se: "SE",
+    sweden: "SE",
+
+    ch: "CH",
+    switzerland: "CH",
+
+    sy: "SY",
+    syria: "SY",
+
+    tj: "TJ",
+    tajikistan: "TJ",
+
+    tz: "TZ",
+    tanzania: "TZ",
+
+    th: "TH",
+    thailand: "TH",
+
+    tl: "TL",
+    "timor-leste": "TL",
+
+    tg: "TG",
+    to: "TO",
+    tonga: "TO",
+
+    tt: "TT",
+    "trinidad and tobago": "TT",
+
+    tn: "TN",
+    tunisia: "TN",
+
+    tr: "TR",
+    turkey: "TR",
+
+    tm: "TM",
+    turkmenistan: "TM",
+
+    tv: "TV",
+    tuvalu: "TV",
+
+    ug: "UG",
+    uganda: "UG",
+
+    ua: "UA",
+    ukraine: "UA",
+
+    ae: "AE",
+    "united arab emirates": "AE",
+
+    gb: "GB",
+    uk: "GB",
+    "united kingdom": "GB",
+
+    us: "US",
+    usa: "US",
+    "united states": "US",
+
+    uy: "UY",
+    uruguay: "UY",
+
+    uz: "UZ",
+    uzbekistan: "UZ",
+
+    vu: "VU",
+    vanuatu: "VU",
+
+    va: "VA",
+    vatican: "VA",
+    "vatican city": "VA",
+
+    ve: "VE",
+    venezuela: "VE",
+
+    vn: "VN",
+    vietnam: "VN",
+
+    ye: "YE",
+    yemen: "YE",
+
+    zm: "ZM",
+    zambia: "ZM",
+
+    zw: "ZW",
+    zimbabwe: "ZW",
+  };
+
+  return countries[v] ?? text(value).toUpperCase();
+}
+
+function normalizeCurrency(value: unknown): string {
+  const v = text(value).toUpperCase();
+  // PayChangu documentation has historically shown MK in some verification
+  // examples; MobiFlex uses the ISO application currency MWK internally.
+  return v === "MK" ? "MWK" : v;
+}
+
+function normalizeRole(value: unknown): string {
+  return text(value)
+    .toLowerCase()
+    .replace(/[\s_-]+/g, " ");
+}
+
+function displayRole(role: string): string {
+  switch (normalizeRole(role)) {
+    case "manager":
+      return "Manager";
+
+    case "agent":
+      return "Agent";
+
+    case "sr":
+    case "service representative":
+    case "service rep":
+      return "SR";
+
+    case "shareholder":
+    case "investor":
+    case "shareholder / investor":
+      return "Shareholder / Investor";
+
+    case "customer service":
+    case "customer service staff":
+    case "customer support":
+    case "support":
+      return "Customer Service";
+
+    default:
+      return role;
+  }
+}
+
+function roleCollection(role: string): string {
+  switch (normalizeRole(role)) {
+    case "manager":
+      return "managers";
+
+    case "agent":
+      return "agents";
+
+    case "sr":
+    case "service representative":
+    case "service rep":
+      return "sr_agents";
+
+    case "shareholder":
+    case "investor":
+    case "shareholder / investor":
+      return "shareholders";
+
+    case "customer service":
+    case "customer service staff":
+    case "customer support":
+    case "support":
+      return "customer_service";
+
+    default:
+      return "";
+  }
+}
+
+function roleKycCollection(role: string): string {
+  switch (normalizeRole(role)) {
+    case "manager":
+      return "manager_kyc";
+
+    case "agent":
+      return "agent_kyc";
+
+    case "sr":
+    case "service representative":
+    case "service rep":
+      return "sr_kyc";
+
+    case "shareholder":
+    case "investor":
+    case "shareholder / investor":
+      return "shareholder_kyc";
+
+    case "customer service":
+    case "customer service staff":
+    case "customer support":
+    case "support":
+      return "customer_service_kyc";
+
+    default:
+      return "";
+  }
+}
+
+function normalizeOperator(value: unknown): "airtel" | "tnm" | "" {
+  const v = text(value).toLowerCase().replace(/[\s_-]+/g, "");
+  if (v === "airtel" || v === "airtelmoney") return "airtel";
+  if (v === "tnm" || v === "tnmmpamba" || v === "mpamba") return "tnm";
+  return "";
+}
+
+function createTransactionId(prefix = "MFA"): string {
+  return `${prefix}-${Date.now()}-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+}
+function cleanMalawiMobile(value: unknown): string {
+  let v = text(value).replace(/[\s\-()]/g, "");
+
+  if (v.startsWith("+265")) {
+    return v;
+  }
+
+  if (v.startsWith("265")) {
+    return `+${v}`;
+  }
+
+  if (v.startsWith("0")) {
+    return `+265${v.substring(1)}`;
+  }
+
+  if (v.startsWith("9") || v.startsWith("8")) {
+    return `+265${v}`;
+  }
+
+  return v;
+}
+
+function normalizeInternationalPhone(
+  value: unknown,
+  countryCode: string,
+): string {
+  let v = text(value).replace(/[^\d+]/g, "");
+
+  const code = text(countryCode).trim().toUpperCase();
+
+  const countryPrefixes: Record<string, string> = {
+    AF: "93",
+    AL: "355",
+    DZ: "213",
+    AD: "376",
+    AO: "244",
+    AG: "1",
+    AR: "54",
+    AM: "374",
+    AU: "61",
+    AT: "43",
+    AZ: "994",
+    BS: "1",
+    BH: "973",
+    BD: "880",
+    BB: "1",
+    BY: "375",
+    BE: "32",
+    BZ: "501",
+    BJ: "229",
+    BT: "975",
+    BO: "591",
+    BA: "387",
+    BW: "267",
+    BR: "55",
+    BN: "673",
+    BG: "359",
+    BF: "226",
+    BI: "257",
+    CV: "238",
+    KH: "855",
+    CM: "237",
+    CA: "1",
+    CF: "236",
+    TD: "235",
+    CL: "56",
+    CN: "86",
+    CO: "57",
+    KM: "269",
+    CG: "242",
+    CD: "243",
+    CR: "506",
+    CI: "225",
+    HR: "385",
+    CU: "53",
+    CY: "357",
+    CZ: "420",
+    DK: "45",
+    DJ: "253",
+    DM: "1",
+    DO: "1",
+    EC: "593",
+    EG: "20",
+    SV: "503",
+    GQ: "240",
+    ER: "291",
+    EE: "372",
+    SZ: "268",
+    ET: "251",
+    FJ: "679",
+    FI: "358",
+    FR: "33",
+    GA: "241",
+    GM: "220",
+    GE: "995",
+    DE: "49",
+    GH: "233",
+    GR: "30",
+    GD: "1",
+    GT: "502",
+    GN: "224",
+    GW: "245",
+    GY: "592",
+    HT: "509",
+    HN: "504",
+    HU: "36",
+    IS: "354",
+    IN: "91",
+    ID: "62",
+    IR: "98",
+    IQ: "964",
+    IE: "353",
+    IL: "972",
+    IT: "39",
+    JM: "1",
+    JP: "81",
+    JO: "962",
+    KZ: "7",
+    KE: "254",
+    KI: "686",
+    KP: "850",
+    KR: "82",
+    KW: "965",
+    KG: "996",
+    LA: "856",
+    LV: "371",
+    LB: "961",
+    LS: "266",
+    LR: "231",
+    LY: "218",
+    LI: "423",
+    LT: "370",
+    LU: "352",
+    MG: "261",
+    MW: "265",
+    MY: "60",
+    MV: "960",
+    ML: "223",
+    MT: "356",
+    MH: "692",
+    MR: "222",
+    MU: "230",
+    MX: "52",
+    FM: "691",
+    MD: "373",
+    MC: "377",
+    MN: "976",
+    ME: "382",
+    MA: "212",
+    MZ: "258",
+    MM: "95",
+    NA: "264",
+    NR: "674",
+    NP: "977",
+    NL: "31",
+    NZ: "64",
+    NI: "505",
+    NE: "227",
+    NG: "234",
+    MK: "389",
+    NO: "47",
+    OM: "968",
+    PK: "92",
+    PW: "680",
+    PS: "970",
+    PA: "507",
+    PG: "675",
+    PY: "595",
+    PE: "51",
+    PH: "63",
+    PL: "48",
+    PT: "351",
+    QA: "974",
+    RO: "40",
+    RU: "7",
+    RW: "250",
+    KN: "1",
+    LC: "1",
+    VC: "1",
+    WS: "685",
+    SM: "378",
+    ST: "239",
+    SA: "966",
+    SN: "221",
+    RS: "381",
+    SC: "248",
+    SL: "232",
+    SG: "65",
+    SK: "421",
+    SI: "386",
+    SB: "677",
+    SO: "252",
+    ZA: "27",
+    SS: "211",
+    ES: "34",
+    LK: "94",
+    SD: "249",
+    SR: "597",
+    SE: "46",
+    CH: "41",
+    SY: "963",
+    TJ: "992",
+    TZ: "255",
+    TH: "66",
+    TL: "670",
+    TG: "228",
+    TO: "676",
+    TT: "1",
+    TN: "216",
+    TR: "90",
+    TM: "993",
+    TV: "688",
+    UG: "256",
+    UA: "380",
+    AE: "971",
+    GB: "44",
+    US: "1",
+    UY: "598",
+    UZ: "998",
+    VU: "678",
+    VA: "39",
+    VE: "58",
+    VN: "84",
+    YE: "967",
+    ZM: "260",
+    ZW: "263",
+  };
+
+  const prefix = countryPrefixes[code];
+
+  if (!prefix) {
+    throw new Error(
+      `Unsupported country phone prefix: ${code}`,
+    );
+  }
+
+  if (!v) {
+    throw new Error("Phone number is required.");
+  }
+
+  if (v.startsWith("+")) {
+    return v;
+  }
+
+  if (v.startsWith("00")) {
+    return `+${v.substring(2)}`;
+  }
+
+  if (v.startsWith(prefix)) {
+    return `+${v}`;
+  }
+
+  if (v.startsWith("0")) {
+    return `+${prefix}${v.substring(1)}`;
+  }
+
+  return `+${prefix}${v}`;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "{}";
+  }
+}
+
+function providerStatus(data: any): string {
+  return text(
+    data?.status ??
+      data?.data?.status ??
+      data?.data?.transaction?.status ??
+      data?.transaction?.status,
+  ).toLowerCase();
+}
+
+function providerChargeId(data: any): string {
+  return text(
+    data?.charge_id ??
+      data?.chargeId ??
+      data?.data?.charge_id ??
+      data?.data?.chargeId ??
+      data?.data?.transaction?.charge_id ??
+      data?.transaction?.charge_id,
+  );
+}
+
+function providerReference(data: any): string {
+  return text(
+    data?.tx_ref ??
+      data?.reference ??
+      data?.data?.tx_ref ??
+      data?.data?.reference ??
+      data?.data?.transaction?.tx_ref ??
+      data?.data?.transaction?.reference,
+  );
+}
+
+function providerAmount(data: any): number {
+  const values = [
+    data?.amount,
+    data?.data?.amount,
+    data?.data?.transaction?.amount,
+    data?.transaction?.amount,
+  ];
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return money(n);
+  }
+  return 0;
+}
+
+function providerCurrency(data: any): string {
+  return normalizeCurrency(
+    data?.currency ??
+      data?.data?.currency ??
+      data?.data?.transaction?.currency ??
+      data?.transaction?.currency,
+  );
+}
+
+function normalizeFeeType(value: unknown): "percentage" | "fixed" {
+  return text(value).toLowerCase() === "fixed"
+    ? "fixed"
+    : "percentage";
+}
+
+function normalizeFeeBasis(value: unknown): string {
+  return text(value)
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function configuredFeeAmount(
+  type: unknown,
+  value: unknown,
+  basisAmount: number,
+): number {
+  const feeType = normalizeFeeType(type);
+  const feeValue = Math.max(0, money(value));
+
+  if (feeType === "fixed") {
+    return money(feeValue);
+  }
+
+  return money((basisAmount * feeValue) / 100);
+}
+
+function providerFeeFromResponse(data: any): number | null {
+  const candidates = [
+    data?.fee,
+    data?.fees,
+    data?.provider_fee,
+    data?.processing_fee,
+    data?.charge_fee,
+    data?.data?.fee,
+    data?.data?.fees,
+    data?.data?.provider_fee,
+    data?.data?.processing_fee,
+    data?.data?.charge_fee,
+    data?.data?.transaction?.fee,
+    data?.data?.transaction?.fees,
+    data?.data?.transaction?.provider_fee,
+    data?.data?.transaction?.processing_fee,
+    data?.transaction?.fee,
+    data?.transaction?.fees,
+    data?.transaction?.provider_fee,
+    data?.transaction?.processing_fee,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      const nested =
+        candidate.amount ??
+        candidate.value ??
+        candidate.total ??
+        candidate.fee;
+      const nestedNumber = Number(nested);
+      if (Number.isFinite(nestedNumber) && nestedNumber >= 0) {
+        return money(nestedNumber);
+      }
+      continue;
+    }
+
+    const number = Number(candidate);
+    if (Number.isFinite(number) && number >= 0) {
+      return money(number);
+    }
+  }
+
+  return null;
+}
+
+function merchantRuleBasisAmount(
+  basis: unknown,
+  grossAmount: number,
+  applicationData: DocumentData,
+): number {
+  const normalized = normalizeFeeBasis(basis);
+
+  const cashPrice = money(
+    applicationData.cashPrice ??
+      applicationData.phoneCashPrice ??
+      applicationData.cashAmount ??
+      applicationData.cashPriceAmount ??
+      applicationData.phoneCashAmount,
+  );
+
+  const financedAmount = money(
+    applicationData.totalRepayment ??
+      applicationData.totalFinancingAmount ??
+      applicationData.loanAmount ??
+      applicationData.financedAmount,
+  );
+
+  switch (normalized) {
+    case "cash_price":
+      return cashPrice > 0 ? cashPrice : grossAmount;
+    case "financed_amount":
+      return financedAmount > 0 ? financedAmount : grossAmount;
+    case "financing_difference":
+      if (financedAmount > 0 && cashPrice > 0) {
+        return Math.max(0, money(financedAmount - cashPrice));
+      }
+      return 0;
+    case "per_sale":
+      return 1;
+    case "gross_payment":
+    case "payment":
+    case "gross":
+    default:
+      return grossAmount;
+  }
+}
+
+interface MerchantAccountingCalculation {
+  providerFee: number;
+  providerFeeSource: "provider_response" | "country_config" | "none";
+  merchantFee: number;
+  merchantFeeType: "percentage" | "fixed";
+  merchantFeeRate: number;
+  merchantFeeBasis: string;
+  mobiFlexRevenue: number;
+  mobiFlexRevenueType: "percentage" | "fixed";
+  mobiFlexRevenueBasis: string;
+  merchantNetAmount: number;
+  settlementStatus: "Pending";
+}
+
+async function calculateMerchantAccounting(
+  country: string,
+  currency: string,
+  grossAmount: number,
+  applicationData: DocumentData,
+  verification: any,
+): Promise<MerchantAccountingCalculation | null> {
+  const merchantId = text(applicationData.merchantId);
+  if (!merchantId) {
+    return null;
+  }
+
+  const countryCode = normalizeCountry(country);
+  const currencyCode = normalizeCurrency(currency);
+  const configRef = db.collection("country_configs").doc(countryCode);
+  const configSnap = await configRef.get();
+  const config = configSnap.exists ? configSnap.data() ?? {} : {};
+
+  const configCurrency = normalizeCurrency(config.currency);
+  if (configCurrency && configCurrency !== currencyCode) {
+    throw new Error(
+      `Merchant country configuration currency ${configCurrency} does not match payment currency ${currencyCode}.`,
+    );
+  }
+
+  const active = config.active;
+  if (active === false) {
+    throw new Error(
+      `Merchant country configuration for ${countryCode} is inactive.`,
+    );
+  }
+
+  const providerResponseFee = providerFeeFromResponse(verification);
+  let providerFee = 0;
+  let providerFeeSource: MerchantAccountingCalculation["providerFeeSource"] =
+    "none";
+
+  if (providerResponseFee !== null) {
+    providerFee = providerResponseFee;
+    providerFeeSource = "provider_response";
+  } else if (config.providerFeeValue !== undefined) {
+    const providerFeeBasis = merchantRuleBasisAmount(
+      config.providerFeeBasis ?? "gross_payment",
+      grossAmount,
+      applicationData,
+    );
+    providerFee = configuredFeeAmount(
+      config.providerFeeType ?? "percentage",
+      config.providerFeeValue,
+      providerFeeBasis,
+    );
+    providerFeeSource = "country_config";
+  }
+
+  const merchantFeeType = normalizeFeeType(
+    config.merchantFeeType ?? "percentage",
+  );
+  const merchantFeeBasis = normalizeFeeBasis(
+    config.merchantFeeBasis ?? "gross_payment",
+  );
+  const merchantFeeBasisAmount = merchantRuleBasisAmount(
+    merchantFeeBasis,
+    grossAmount,
+    applicationData,
+  );
+  const merchantFee = configuredFeeAmount(
+    merchantFeeType,
+    config.merchantFeeValue,
+    merchantFeeBasisAmount,
+  );
+
+  const mobiFlexRevenueType = normalizeFeeType(
+    config.mobiFlexRevenueType ?? config.platformFeeType ?? "percentage",
+  );
+  const mobiFlexRevenueBasis = normalizeFeeBasis(
+    config.mobiFlexRevenueBasis ?? "gross_payment",
+  );
+  const mobiFlexRevenueBasisAmount = merchantRuleBasisAmount(
+    mobiFlexRevenueBasis,
+    grossAmount,
+    applicationData,
+  );
+  const mobiFlexRevenue = configuredFeeAmount(
+    mobiFlexRevenueType,
+    config.mobiFlexRevenueValue ?? config.platformFeeValue,
+    mobiFlexRevenueBasisAmount,
+  );
+
+  const merchantNetAmount = money(
+    Math.max(0, grossAmount - providerFee - merchantFee),
+  );
+
+  return {
+    providerFee,
+    providerFeeSource,
+    merchantFee,
+    merchantFeeType,
+    merchantFeeRate:
+      merchantFeeType === "percentage"
+        ? Math.max(0, money(config.merchantFeeValue))
+        : 0,
+    merchantFeeBasis,
+    mobiFlexRevenue,
+    mobiFlexRevenueType,
+    mobiFlexRevenueBasis,
+    merchantNetAmount,
+    settlementStatus: "Pending",
+  };
+}
+
+function isSuccess(status: string): boolean {
+  return ["success", "successful", "paid", "completed", "complete"].includes(
+    status.toLowerCase(),
+  );
+}
+
+function isFailed(status: string): boolean {
+  return [
+    "failed",
+    "failure",
+    "cancelled",
+    "canceled",
+    "rejected",
+    "declined",
+  ].includes(status.toLowerCase());
+}
+
+function isPending(status: string): boolean {
+  return [
+    "pending",
+    "processing",
+    "initiated",
+    "submitted",
+    "in_progress",
+  ].includes(status.toLowerCase());
+}
+
+function assertPayChanguConfigured(): void {
+  if (!PAYCHANGU_SECRET_KEY) {
+    throw new Error("PAYCHANGU_SECRET_KEY is not configured.");
+  }
+
+  if (!PAYCHANGU_WEBHOOK_SECRET) {
+    // Verification endpoints can work without a webhook secret, but live
+    // production should configure it. Webhook route will enforce it.
+  }
+
+  if (
+    PAYCHANGU_LIVE_ONLY &&
+    /^sec-test/i.test(PAYCHANGU_SECRET_KEY)
+  ) {
+    throw new Error(
+      "A PayChangu test key is configured while PAYCHANGU_LIVE_ONLY=true.",
+    );
+  }
+}
+
+// ============================================================
+// AUTH
+// ============================================================
+
+async function verifyBearerToken(req: Request): Promise<{
+  uid: string;
+  email: string;
+}> {
+  const header = text(req.headers.authorization);
+  if (!header.startsWith("Bearer ")) {
+    throw new Error("Authorization token is required.");
+  }
+  const token = header.substring(7).trim();
+  if (!token) throw new Error("Authorization token is empty.");
+
+  const decoded = await auth.verifyIdToken(token);
+  return {
+    uid: decoded.uid,
+    email: decoded.email ?? "",
+  };
+}
+
+async function verifySuperAdmin(req: Request): Promise<{
+  uid: string;
+  email: string;
+}> {
+  const decoded = await verifyBearerToken(req);
+  const snap = await db.collection("users").doc(decoded.uid).get();
+  if (!snap.exists) throw new Error("Super Admin profile was not found.");
+
+  const role = normalizeRole(snap.data()?.role);
+  const allowed = [
+    "super admin",
+    "superadmin",
+    "super administrator",
+    "admin",
+  ];
+
+  if (!allowed.includes(role)) {
+    throw new Error("Only Super Admin can perform this action.");
+  }
+
+  const status = text(
+    snap.data()?.status ?? snap.data()?.accountStatus ?? "active",
+  ).toLowerCase();
+
+  if (["disabled", "blocked", "inactive", "suspended"].includes(status)) {
+    throw new Error("Super Admin account is not active.");
+  }
+
+  return decoded;
+}
+// ============================================================
+// CUSTOMER ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â CONFIRM CUSTOMER SERVICE VERIFICATION
+// ============================================================
+
+app.post(
+  "/customer-service/customer/verification/confirm",
+  async (req: Request, res: Response) => {
+    try {
+      // Customer must be authenticated with their own
+      // Firebase/MobiFlex customer account.
+      const authenticated = await verifyCustomer(req);
+
+      const verificationId = text(
+        req.body?.verificationId,
+      );
+
+     if (!verificationId) {
+  return res.status(400).json({
+    success: false,
+    message:
+      "Verification ID is required.",
+  });
+}
+
+      const verificationRef = db
+        .collection("customer_service_verifications")
+        .doc(verificationId);
+
+      const verificationSnap =
+        await verificationRef.get();
+
+      if (!verificationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Verification request was not found.",
+        });
+      }
+
+      const verification =
+        verificationSnap.data() ?? {};
+
+      // --------------------------------------------------------
+      // SESSION STATUS
+      // --------------------------------------------------------
+
+      if (
+        text(verification.status) !== "pending"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This verification request is no longer pending.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // EXPIRY
+      // --------------------------------------------------------
+
+      const expiresAt = Number(
+        verification.expiresAt ?? 0,
+      );
+
+      if (
+        !expiresAt ||
+        Date.now() > expiresAt
+      ) {
+        await verificationRef.set(
+          {
+            status: "expired",
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "This verification request has expired.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // CHALLENGE CHECK
+      // --------------------------------------------------------
+
+      
+
+      // --------------------------------------------------------
+      // CUSTOMER IDENTITY CHECK
+      // --------------------------------------------------------
+
+      const verificationCustomerId = text(
+        verification.customerId,
+      );
+
+      if (!verificationCustomerId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Verification request has no customer reference.",
+        });
+      }
+
+      if (
+        !authenticated.customer.ids.has(
+          verificationCustomerId,
+        )
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "This verification request does not belong to the authenticated customer.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // MARK VERIFIED
+      // --------------------------------------------------------
+
+      const verifiedAt =
+        FieldValue.serverTimestamp();
+
+      await verificationRef.set(
+        {
+          status: "verified",
+          verified: true,
+          verifiedByCustomerUid:
+            authenticated.uid,
+          verifiedAt,
+          updatedAt: verifiedAt,
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        verified: true,
+        verificationId,
+        status: "verified",
+        expiresAt,
+        message:
+          "Customer identity confirmed successfully. Customer Service may now request protected information.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer verification confirmation error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        verified: false,
+        message:
+          error?.message ??
+          "Unable to confirm customer verification.",
+      });
+    }
+  },
+);
+app.post(
+  "/customer-service/customer/verification/details",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const verificationId = text(
+        req.body?.verificationId,
+      );
+
+      const customerId = text(
+        req.body?.customerId,
+      );
+
+      if (!verificationId || !customerId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Verification ID and customer ID are required.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // LOAD VERIFICATION SESSION
+      // --------------------------------------------------------
+
+      const verificationRef = db
+        .collection("customer_service_verifications")
+        .doc(verificationId);
+
+      const verificationSnap =
+        await verificationRef.get();
+
+      if (!verificationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Verification session was not found.",
+        });
+      }
+
+      const verification =
+        verificationSnap.data() ?? {};
+
+      // --------------------------------------------------------
+      // STAFF OWNERSHIP
+      // --------------------------------------------------------
+
+      if (
+        text(verification.staffUid) !== staff.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "This verification session belongs to another Customer Service account.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // CUSTOMER OWNERSHIP
+      // --------------------------------------------------------
+
+      if (
+        text(verification.customerId) !==
+        customerId
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Customer does not match the verification session.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // VERIFICATION STATUS
+      // --------------------------------------------------------
+
+      if (
+        text(verification.status) !== "verified"
+      ) {
+        return res.status(403).json({
+          success: false,
+          verified: false,
+          message:
+            "Customer verification has not been completed.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // VERIFICATION EXPIRY
+      // --------------------------------------------------------
+
+      const expiresAt = Number(
+        verification.expiresAt ?? 0,
+      );
+
+      if (
+        !expiresAt ||
+        Date.now() > expiresAt
+      ) {
+        await verificationRef.set(
+          {
+            status: "expired",
+            verified: false,
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(403).json({
+          success: false,
+          verified: false,
+          message:
+            "Customer verification has expired. Start a new verification.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // LOAD CUSTOMER
+      // --------------------------------------------------------
+
+      const customerRef = db
+        .collection("customers")
+        .doc(customerId);
+
+      const customerSnap =
+        await customerRef.get();
+
+      if (!customerSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Customer profile was not found.",
+        });
+      }
+
+      const customer =
+        customerSnap.data() ?? {};
+
+      const role = normalizeRole(
+        customer.role ?? "customer",
+      );
+
+      if (
+        role !== "customer" &&
+        role !== "customer user"
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "The selected account is not a customer account.",
+        });
+      }
+
+      const customerStatus = text(
+        customer.status ??
+          customer.accountStatus ??
+          "active",
+      )
+        .trim()
+        .toLowerCase();
+
+      if (
+        [
+          "disabled",
+          "blocked",
+          "inactive",
+          "suspended",
+          "rejected",
+        ].includes(customerStatus)
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Customer account is not active.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // LIMITED PROTECTED CUSTOMER INFORMATION
+      // --------------------------------------------------------
+
+      const customerName = text(
+        customer.name ??
+          customer.fullName ??
+          customer.customerName,
+      );
+
+      const customerPhone = text(
+        customer.phone ??
+          customer.customerPhone,
+      );
+
+      const customerCountry = normalizeCountry(
+        customer.country ??
+          customer.countryCode ??
+          "MW",
+      );
+
+      const referralNumber = text(
+        customer.referralNumber ??
+          customer.customerReferralNumber ??
+          customer.referral,
+      );
+
+      // --------------------------------------------------------
+      // APPLICATION LOOKUP
+      // --------------------------------------------------------
+
+      const applicationsSnapshot =
+        await db
+          .collection("applications")
+          .where(
+            "customerId",
+            "==",
+            customerId,
+          )
+          .limit(20)
+          .get();
+
+      const applications =
+        applicationsSnapshot.docs.map(
+          (doc) => {
+            const data = doc.data();
+
+            return {
+              id: doc.id,
+              referenceNumber: text(
+                data.applicationReference ??
+                  data.applicationRef ??
+                  data.referenceNumber ??
+                  data.referralNumber ??
+                  doc.id,
+              ),
+              status: text(
+                data.status ?? "",
+              ),
+              model: text(
+                data.model ??
+                  data.phoneModel ??
+                  data.deviceModel,
+              ),
+              imei: text(
+                data.imei,
+              ),
+              financingStatus: text(
+                data.financingStatus ??
+                  data.financeStatus,
+              ),
+              paymentStatus: text(
+                data.paymentStatus,
+              ),
+              balance: data.balance ?? null,
+              totalRepayment:
+                data.totalRepayment ?? null,
+              deposit:
+                data.deposit ?? null,
+              dailyPayment:
+                data.dailyPayment ?? null,
+              weeklyPayment:
+                data.weeklyPayment ?? null,
+              monthlyPayment:
+                data.monthlyPayment ?? null,
+            };
+          },
+        );
+
+      // --------------------------------------------------------
+      // DEVICE LOOKUP
+      // --------------------------------------------------------
+
+      const devicesSnapshot =
+        await db
+          .collection("devices")
+          .where(
+            "customerId",
+            "==",
+            customerId,
+          )
+          .limit(20)
+          .get();
+
+      const devices =
+        devicesSnapshot.docs.map(
+          (doc) => {
+            const data = doc.data();
+
+            return {
+              id: doc.id,
+              imei: text(
+                data.imei,
+              ),
+              model: text(
+                data.model ??
+                  data.phoneModel ??
+                  data.deviceModel,
+              ),
+              status: text(
+                data.status,
+              ),
+              lockStatus: text(
+                data.lockStatus ??
+                  data.lockState ??
+                  data.lock,
+              ),
+              applicationId: text(
+                data.applicationId,
+              ),
+            };
+          },
+        );
+
+      // --------------------------------------------------------
+      // MARK ACCESS
+      // --------------------------------------------------------
+
+      await verificationRef.set(
+        {
+          lastAccessedAt:
+            FieldValue.serverTimestamp(),
+          lastAccessedByStaffUid:
+            staff.uid,
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        verified: true,
+        verificationId,
+        expiresAt,
+
+        customer: {
+          id: customerId,
+          name: customerName,
+          phone: customerPhone,
+          country: customerCountry,
+          referralNumber,
+          status: customerStatus,
+        },
+
+        applications,
+        devices,
+
+        message:
+          "Protected customer information retrieved successfully.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service protected details error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to retrieve protected customer information.",
+      });
+    }
+  },
+);
+// ============================================================
+// CUSTOMER - PENDING CUSTOMER SERVICE VERIFICATION
+// ============================================================
+
+app.get(
+  "/customer/customer-service/verification/pending",
+  async (req, res) => {
+    try {
+      const authenticated = await verifyCustomer(req);
+
+      const customerIds = Array.from(
+        authenticated.customer.ids,
+      );
+
+      if (customerIds.length === 0) {
+        return res.status(404).json({
+          success: false,
+          pending: false,
+          message: "Customer profile was not found.",
+        });
+      }
+
+      const sessions = new Map<
+        string,
+        DocumentData & { id: string }
+      >();
+
+      for (const customerId of customerIds) {
+        const snapshot = await db
+          .collection("customer_service_verifications")
+          .where("customerId", "==", customerId)
+          .where("status", "==", "pending")
+          .limit(20)
+          .get();
+
+        for (const doc of snapshot.docs) {
+          sessions.set(doc.id, {
+            id: doc.id,
+            ...(doc.data() ?? {}),
+          });
+        }
+      }
+
+      const now = Date.now();
+
+      const pending = Array.from(sessions.values())
+        .filter((verification) => {
+          const expiresAt = verification.expiresAt;
+
+          let expiresAtMs = 0;
+
+          if (
+            expiresAt &&
+            typeof expiresAt.toMillis === "function"
+          ) {
+            expiresAtMs = expiresAt.toMillis();
+          } else if (
+            expiresAt &&
+            typeof expiresAt.seconds === "number"
+          ) {
+            expiresAtMs =
+              expiresAt.seconds * 1000;
+          }
+
+          return (
+            !expiresAtMs ||
+            expiresAtMs > now
+          );
+        })
+        .sort((a, b) => {
+          const aTime =
+            a.createdAt?.toMillis?.() ?? 0;
+          const bTime =
+            b.createdAt?.toMillis?.() ?? 0;
+
+          return bTime - aTime;
+        });
+
+      if (pending.length === 0) {
+        return res.status(200).json({
+          success: true,
+          pending: false,
+          verification: null,
+        });
+      }
+
+      const verification = pending[0];
+
+      return res.status(200).json({
+        success: true,
+        pending: true,
+        verification: {
+          verificationId: verification.id,
+          customerId: text(
+            verification.customerId,
+          ),
+          status: text(
+            verification.status,
+          ),
+          expiresAt:
+            verification.expiresAt ?? null,
+          createdAt:
+            verification.createdAt ?? null,
+          staffEmail:
+            text(verification.staffEmail),
+          message:
+            "Customer Service is requesting permission to view your protected MobiFlex account information.",
+        },
+      });
+    } catch (error: any) {
+      return res.status(401).json({
+        success: false,
+        pending: false,
+        message:
+          error?.message ??
+          "Unable to check customer verification request.",
+      });
+    }
+  },
+);
+// ============================================================
+// CUSTOMER SERVICE VERIFICATION SESSION
+// ============================================================
+
+const CUSTOMER_SERVICE_VERIFICATION_TTL_MS =
+  5 * 60 * 1000;
+
+function generateCustomerServiceVerificationId(): string {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function generateCustomerServiceChallenge(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+async function verifyStaff(
+  req: Request,
+  allowedRoles = [
+    "super admin",
+    "superadmin",
+    "super administrator",
+    "manager",
+    "agent",
+    "sr",
+    "finance",
+  ],
+): Promise<{
+  uid: string;
+  email: string;
+  userData: DocumentData;
+}> {
+  const decoded = await verifyBearerToken(req);
+  const snap = await db.collection("users").doc(decoded.uid).get();
+  if (!snap.exists) throw new Error("User profile was not found.");
+
+  const userData = snap.data() ?? {};
+  const role = normalizeRole(userData.role ?? userData.accountType);
+  const normalizedAllowed = allowedRoles.map(normalizeRole);
+
+  if (!normalizedAllowed.includes(role)) {
+    throw new Error("You are not authorized to perform this action.");
+  }
+
+  const status = text(
+    userData.status ?? userData.accountStatus ?? "active",
+  ).toLowerCase();
+  if (["disabled", "blocked", "inactive", "suspended", "rejected"].includes(status)) {
+    throw new Error("User account is not active.");
+  }
+
+  return {
+    uid: decoded.uid,
+    email: decoded.email || text(userData.email),
+    userData,
+  };
+}
+
+async function getCustomerProfile(uid: string) {
+  const userSnap = await db.collection("users").doc(uid).get();
+  const customerSnap = await db.collection("customers").doc(uid).get();
+
+  if (!userSnap.exists && !customerSnap.exists) {
+    throw new Error("Customer profile was not found.");
+  }
+
+  const data = {
+    ...(userSnap.data() ?? {}),
+    ...(customerSnap.data() ?? {}),
+  };
+
+  const role = normalizeRole(data.role ?? "customer");
+  if (role !== "customer" && role !== "customer user") {
+    throw new Error("Authenticated account is not a customer account.");
+  }
+
+  const ids = new Set<string>([uid]);
+  for (const field of [
+    "customerId",
+    "systemId",
+    "customerSystemId",
+    "accountNumber",
+    "referralNumber",
+    "customerUid",
+    "userId",
+  ]) {
+    const value = text(data[field]);
+    if (value) ids.add(value);
+  }
+
+  return {
+    uid,
+    ids,
+    name: text(data.name ?? data.fullName ?? data.customerName),
+    email: text(data.email),
+    phone: text(data.phone ?? data.customerPhone),
+    country: normalizeCountry(data.country ?? data.countryCode ?? "MW"),
+    data,
+  };
+}
+
+async function verifyCustomer(req: Request) {
+  const decoded = await verifyBearerToken(req);
+  return {
+    uid: decoded.uid,
+    email: decoded.email,
+    customer: await getCustomerProfile(decoded.uid),
+  };
+}
+
+// ============================================================
+// APPLICATION / FINANCING HELPERS
+// ============================================================
+
+async function loadApplication(applicationId: string) {
+  const id = text(applicationId);
+  if (!id) throw new Error("Application ID is required.");
+
+  const ref = db.collection("applications").doc(id);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Application not found.");
+
+  return {
+    ref,
+    data: snap.data() ?? {},
+  };
+}
+
+async function assertApplicationOwner(
+  applicationId: string,
+  customerIds: Set<string>,
+) {
+  const application = await loadApplication(applicationId);
+  const applicationCustomerId = text(
+    application.data.customerId ??
+      application.data.customerUid ??
+      application.data.userId,
+  );
+
+  if (
+    !applicationCustomerId ||
+    !customerIds.has(applicationCustomerId)
+  ) {
+    throw new Error(
+      "This application does not belong to the authenticated customer.",
+    );
+  }
+
+  return application;
+}
+
+function applicationCountry(data: DocumentData): string {
+  return normalizeCountry(data.country ?? data.countryCode ?? "MW");
+}
+
+function applicationCurrency(data: DocumentData): string {
+  return normalizeCurrency(
+    data.currency ??
+      data.financeCurrency ??
+      data.loanCurrency ??
+      "MWK",
+  );
+}
+
+function outstandingAmount(data: DocumentData): number {
+  const financingStatus = text(
+    data.financingStatus ?? data.financing_state,
+  ).toLowerCase();
+
+  const depositRemaining = money(
+    data.depositRemaining ??
+      data.remainingDeposit ??
+      data.depositBalance ??
+      data.depositDue,
+  );
+
+  const loanRemaining = money(
+    data.remainingAmount ??
+      data.remainingBalance ??
+      data.loanRemaining ??
+      data.balance,
+  );
+
+  const financingActive = [
+    "active",
+    "financing_active",
+    "financing active",
+  ].includes(financingStatus);
+
+  if (!financingActive && depositRemaining > 0) {
+    return depositRemaining;
+  }
+
+  if (loanRemaining > 0) return loanRemaining;
+  if (depositRemaining > 0) return depositRemaining;
+  return 0;
+}
+
+function firstName(name: string): string {
+  return text(name).split(/\s+/)[0] || "Customer";
+}
+
+function lastName(name: string): string {
+  const parts = text(name).split(/\s+/).filter(Boolean);
+  return parts.length > 1 ? parts.slice(1).join(" ") : "";
+}
+
+// ============================================================
+// APPLICATION WORKFLOW HELPERS
+// ============================================================
+
+function workflowState(data: DocumentData): ApplicationWorkflowState {
+  const value = text(
+    data.workflowState ?? data.lifecycleState ?? data.applicationStage,
+  ).toUpperCase();
+
+  const aliases: Record<string, ApplicationWorkflowState> = {
+    PENDING: "PENDING",
+    APPROVED: "APPROVED",
+    IMEI_VERIFIED: "IMEI_VERIFIED",
+    CUSTOMER_VERIFIED: "CUSTOMER_VERIFIED",
+    DEVICE_INSTALLING: "DEVICE_INSTALLING",
+    DEVICE_READY: "DEVICE_READY",
+    AGREEMENT_SIGNED: "AGREEMENT_SIGNED",
+    READY_FOR_DEPOSIT: "READY_FOR_DEPOSIT",
+    DEPOSIT_PENDING: "DEPOSIT_PENDING",
+    SALE_COMPLETE: "SALE_COMPLETE",
+    FINANCING_ACTIVE: "FINANCING_ACTIVE",
+    PAID_OFF: "PAID_OFF",
+    EXPIRED: "EXPIRED",
+    REJECTED: "REJECTED",
+    ACTIVE: "FINANCING_ACTIVE",
+    COMPLETED: "SALE_COMPLETE",
+  };
+
+  return aliases[value] || "PENDING";
+}
+
+function snapshotData(snapshot: any): DocumentData {
+  if (snapshot && typeof snapshot.data === "function") {
+    return snapshot.data() ?? {};
+  }
+
+  if (snapshot && Array.isArray(snapshot.docs) && snapshot.docs.length > 0) {
+    const firstDoc = snapshot.docs[0];
+    if (firstDoc && typeof firstDoc.data === "function") {
+      return firstDoc.data() ?? {};
+    }
+  }
+
+  return {};
+}
+
+function timestampToMillis(value: unknown): number {
+  if (value instanceof Timestamp) return value.toMillis();
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (value && typeof value === "object") {
+    const candidate = value as { toMillis?: () => number };
+    if (typeof candidate.toMillis === "function") {
+      try {
+        return candidate.toMillis();
+      } catch {}
+    }
+  }
+  return 0;
+}
+
+function applicationExpiryTimestamp(
+  createdAt: unknown,
+): Timestamp {
+  const createdMillis = timestampToMillis(createdAt);
+  const base = createdMillis > 0 ? createdMillis : Date.now();
+  return Timestamp.fromMillis(
+    base + APPLICATION_PENDING_TIMEOUT_MS,
+  );
+}
+
+function isApplicationExpired(data: DocumentData): boolean {
+  if (workflowState(data) !== "PENDING") return false;
+  const expiresAt = timestampToMillis(data.expiresAt);
+  return expiresAt > 0 && expiresAt <= Date.now();
+}
+
+async function expireApplicationIfNeeded(
+  applicationId: string,
+  application?: { ref: any; data: DocumentData },
+) {
+  const loaded =
+    application ?? await loadApplication(applicationId);
+
+  if (!isApplicationExpired(loaded.data)) return loaded;
+
+  await loaded.ref.set(
+    {
+      status: "Expired",
+      applicationStatus: "Expired",
+      workflowState: "EXPIRED",
+      lifecycleState: "EXPIRED",
+      expiredAt: FieldValue.serverTimestamp(),
+      expiredReason: `Pending application exceeded ${APPLICATION_PENDING_TIMEOUT_MINUTES} minutes.`,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  return {
+    ref: loaded.ref,
+    data: {
+      ...loaded.data,
+      status: "Expired",
+      applicationStatus: "Expired",
+      workflowState: "EXPIRED",
+      lifecycleState: "EXPIRED",
+    },
+  };
+}
+
+function assertTransition(
+  current: ApplicationWorkflowState,
+  allowed: ApplicationWorkflowState[],
+  action: string,
+): void {
+  if (!allowed.includes(current)) {
+    throw new Error(
+      `Cannot ${action} while application workflow is ${current}.`,
+    );
+  }
+}
+
+function normalizeImei(value: unknown): string {
+  return text(value).replace(/\D/g, "");
+}
+
+function allowedCountryCurrency(
+  country: string,
+  currency: string,
+): boolean {
+  const pairs: Record<string, string> = {
+    MW: "MWK",
+    ZM: "ZMW",
+    TZ: "TZS",
+    KE: "KES",
+    UG: "UGX",
+    RW: "RWF",
+    ZA: "ZAR",
+    ZW: "ZWL",
+  };
+
+  return pairs[country] === currency;
+}
+
+function nextWorkflowAction(state: ApplicationWorkflowState): string {
+  switch (state) {
+    case "PENDING":
+      return "WAIT_FOR_APPROVAL";
+    case "APPROVED":
+      return "ADD_IMEI";
+    case "IMEI_VERIFIED":
+      return "CAPTURE_CUSTOMER_PHOTO_AND_SIGNATURE";
+    case "CUSTOMER_VERIFIED":
+      return "START_DEVICE_SETUP";
+    case "DEVICE_INSTALLING":
+      return "WAIT_FOR_DEVICE_READY";
+    case "DEVICE_READY":
+      return "CUSTOMER_SIGN_AGREEMENT_ON_PHONE";
+    case "AGREEMENT_SIGNED":
+      return "MAKE_DEPOSIT";
+    case "READY_FOR_DEPOSIT":
+    case "DEPOSIT_PENDING":
+      return "MAKE_DEPOSIT";
+    case "SALE_COMPLETE":
+      return "FINANCING_ACTIVE";
+    case "FINANCING_ACTIVE":
+      return "MAKE_INSTALLMENT_PAYMENT";
+    case "PAID_OFF":
+      return "COMPLETED";
+    case "EXPIRED":
+      return "CREATE_NEW_APPLICATION";
+    case "REJECTED":
+      return "REVIEW_AND_CREATE_NEW_APPLICATION";
+    default:
+      return "CONTACT_SUPPORT";
+  }
+}
+
+async function expirePendingApplicationsBatch(): Promise<number> {
+  const now = Timestamp.now();
+  const snapshot = await db
+    .collection("applications")
+    .where("expiresAt", "<=", now)
+    .limit(200)
+    .get();
+
+  const expired = snapshot.docs.filter((doc) =>
+    isApplicationExpired(doc.data()),
+  );
+
+  if (expired.length === 0) return 0;
+
+  const batch = db.batch();
+  for (const doc of expired) {
+    batch.set(
+      doc.ref,
+      {
+        status: "Expired",
+        applicationStatus: "Expired",
+        workflowState: "EXPIRED",
+        lifecycleState: "EXPIRED",
+        expiredAt: FieldValue.serverTimestamp(),
+        expiredReason: `Pending application exceeded ${APPLICATION_PENDING_TIMEOUT_MINUTES} minutes.`,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  }
+  await batch.commit();
+  return expired.length;
+}
+
+// Best-effort server-side expiry. Each protected lifecycle action also
+// checks the expiry itself, so a server restart cannot make an expired
+// application valid again.
+setInterval(() => {
+  expirePendingApplicationsBatch().catch((error) => {
+    console.error("Application expiry sweep failed:", error);
+  });
+}, 60 * 1000);
+
+// ============================================================
+// PAYCHANGU API
+// ============================================================
+
+async function payChanguRequest(
+  path: string,
+  options: {
+    method: "GET" | "POST";
+    body?: Record<string, unknown>;
+  },
+) {
+  assertPayChanguConfigured();
+
+  const response = await fetch(`${PAYCHANGU_BASE_URL}${path}`, {
+    method: options.method,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${PAYCHANGU_SECRET_KEY}`,
+    },
+    ...(options.body
+      ? { body: JSON.stringify(options.body) }
+      : {}),
+  });
+
+  const raw = await response.text();
+  let data: any = {};
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    data = { raw };
+  }
+
+  return {
+    response,
+    data,
+    raw,
+  };
+}
+
+async function getPayChanguOperators(): Promise<any[]> {
+  const result = await payChanguRequest("/mobile-money/", {
+    method: "GET",
+  });
+
+  if (!result.response.ok) {
+    throw new Error(
+      `PayChangu operator request failed with HTTP ${result.response.status}: ${result.raw}`,
+    );
+  }
+
+  const candidates = [
+    result.data?.data,
+    result.data?.operators,
+    result.data,
+  ];
+
+  return candidates.find(Array.isArray) ?? [];
+}
+
+async function resolvePayChanguOperator(operator: string) {
+  const normalized = normalizeOperator(operator);
+  if (!normalized) throw new Error("Mobile-money operator is required.");
+
+  const refId =
+    normalized === "airtel"
+      ? PAYCHANGU_AIRTEL_OPERATOR_REF_ID
+      : PAYCHANGU_TNM_OPERATOR_REF_ID;
+
+  const operators = await getPayChanguOperators();
+  const match = operators.find(
+    (item: any) =>
+      text(item?.ref_id ?? item?.refId) === refId,
+  );
+
+  if (!match) {
+    throw new Error(
+      `Configured PayChangu ${normalized} operator ref_id is not currently available.`,
+    );
+  }
+
+  const country = normalizeCountry(
+    match?.country ?? match?.country_code,
+  );
+  const currency = normalizeCurrency(
+    match?.currency ?? match?.currency_code,
+  );
+
+  if (country && country !== "MW") {
+    throw new Error("Configured operator is not a Malawi operator.");
+  }
+
+  if (currency && currency !== "MWK") {
+    throw new Error("Configured operator is not an MWK operator.");
+  }
+
+  return {
+    operator: normalized,
+    refId,
+    providerName: text(match?.name ?? normalized),
+  };
+}
+
+async function initializePayChanguMobileMoney(input: {
+  mobile: string;
+  amount: number;
+  chargeId: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  operatorRefId: string;
+}) {
+  const result = await payChanguRequest(
+    "/mobile-money/payments/initialize",
+    {
+      method: "POST",
+      body: {
+        mobile: input.mobile,
+        mobile_money_operator_ref_id:
+          input.operatorRefId,
+        amount: input.amount.toFixed(2),
+        charge_id: input.chargeId,
+        ...(input.email ? { email: input.email } : {}),
+        ...(input.firstName
+          ? { first_name: input.firstName }
+          : {}),
+        ...(input.lastName
+          ? { last_name: input.lastName }
+          : {}),
+      },
+    },
+  );
+
+  if (!result.response.ok) {
+    throw new Error(
+      `PayChangu payment initialization failed with HTTP ${result.response.status}: ${safeJson(result.data)}`,
+    );
+  }
+
+  return {
+    data: result.data,
+    chargeId: providerChargeId(result.data) || input.chargeId,
+    status: providerStatus(result.data) || "pending",
+  };
+}
+
+async function verifyPayChanguCharge(chargeId: string): Promise<any> {
+  if (!text(chargeId)) {
+    throw new Error("PayChangu charge ID is required.");
+  }
+
+  const result = await payChanguRequest(
+    `/mobile-money/payments/${encodeURIComponent(chargeId)}/verify`,
+    {
+      method: "GET",
+    },
+  );
+
+  if (!result.response.ok) {
+    throw new Error(
+      `PayChangu verification failed with HTTP ${result.response.status}: ${safeJson(result.data)}`,
+    );
+  }
+
+  return result.data;
+}
+
+// ============================================================
+// DEVICE SYNCHRONIZATION
+// ============================================================
+
+async function syncDeviceAfterPayment(
+  applicationId: string,
+  remainingAmount: number,
+): Promise<string | null> {
+  const application = await loadApplication(applicationId);
+  const deviceId = text(application.data.deviceId);
+
+  if (!deviceId) {
+    await application.ref.set(
+      {
+        deviceSynchronizationStatus: "NotRequired",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  const deviceQuery = await db
+    .collection("devices")
+    .where("deviceId", "==", deviceId)
+    .limit(1)
+    .get();
+
+  if (deviceQuery.empty) {
+    await application.ref.set(
+      {
+        deviceSynchronizationStatus: "Failed",
+        deviceSynchronizationError:
+          "Financed device was not found.",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  const deviceDoc = deviceQuery.docs[0];
+  const device = deviceDoc.data();
+
+  if (
+    text(device.applicationId) &&
+    text(device.applicationId) !== applicationId
+  ) {
+    await application.ref.set(
+      {
+        deviceSynchronizationStatus: "Failed",
+        deviceSynchronizationError:
+          "Device does not belong to this application.",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  if (remainingAmount > 0) {
+    await deviceDoc.ref.set(
+      {
+        applicationId,
+        remainingAmount: money(remainingAmount),
+        financingStatus: "Active",
+        paymentStatus: "Pending",
+        lockPolicy: "FINANCED_DEVICE",
+        deviceProtectionActive: true,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  const currentLock = text(device.lockStatus).toLowerCase();
+  const desiredLock = text(device.desiredLockStatus).toLowerCase();
+
+  if (currentLock === "unlocked" && desiredLock === "unlocked") {
+    await deviceDoc.ref.set(
+      {
+        applicationId,
+        remainingAmount: 0,
+        financingStatus: "Paid Off",
+        paymentStatus: "Paid",
+        desiredLockStatus: "Unlocked",
+        lockStatus: "Unlocked",
+        deviceProtectionActive: false,
+        unlockCommandStatus: "Completed",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    await application.ref.set(
+      {
+        deviceSynchronizationStatus: "Completed",
+        deviceProtectionActive: false,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  const existing = await db
+    .collection("device_commands")
+    .where("deviceId", "==", deviceId)
+    .where("status", "==", "pending")
+    .limit(20)
+    .get();
+
+  const unlock = existing.docs.find((doc) => {
+    const data = doc.data();
+    return (
+      text(data.command) === "UNLOCK_DEVICE" ||
+      text(data.type) === "UNLOCK_DEVICE"
+    );
+  });
+
+  if (unlock) {
+    await deviceDoc.ref.set(
+      {
+        applicationId,
+        remainingAmount: 0,
+        financingStatus: "Paid Off",
+        paymentStatus: "Paid",
+        desiredLockStatus: "Unlocked",
+        deviceProtectionActive: true,
+        unlockCommandId: unlock.id,
+        unlockCommandStatus: "Pending",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return unlock.id;
+  }
+
+  const agentUid = text(
+    device.agentUid ?? application.data.androidAgentUid,
+  );
+
+  if (!agentUid) {
+    await application.ref.set(
+      {
+        deviceSynchronizationStatus: "Failed",
+        deviceSynchronizationError:
+          "Device agentUid is missing.",
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    return null;
+  }
+
+  const commandRef = db.collection("device_commands").doc();
+  await commandRef.set({
+    commandId: commandRef.id,
+    command: "UNLOCK_DEVICE",
+    type: "UNLOCK_DEVICE",
+    status: "pending",
+    deviceId,
+    deviceDocumentId: deviceDoc.id,
+    applicationId,
+    merchantId:
+      text(application.data.merchantId ?? device.merchantId) || null,
+    agentUid,
+    reason:
+      "Financing has been fully paid and the provider payment was verified.",
+    requestedBy: "paychangu_verified_payment",
+    executionConfirmed: false,
+    deviceLockConfirmed: false,
+    deviceUnlockConfirmed: false,
+    physicalStateConfirmed: false,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  await deviceDoc.ref.set(
+    {
+      applicationId,
+      remainingAmount: 0,
+      financingStatus: "Paid Off",
+      paymentStatus: "Paid",
+      desiredLockStatus: "Unlocked",
+      lockStatus: device.lockStatus ?? "Locked",
+      deviceProtectionActive: true,
+      unlockCommandId: commandRef.id,
+      unlockCommandStatus: "Pending",
+      lockPolicy: "FINANCED_DEVICE",
+      managementRequired: true,
+      deviceManagementRequired: true,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  await application.ref.set(
+    {
+      deviceSynchronizationStatus: "Pending",
+      deviceProtectionActive: true,
+      unlockCommandId: commandRef.id,
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  return commandRef.id;
+}
+
+// ============================================================
+// REAL PAYMENT FINALIZATION
+// ============================================================
+
+async function finalizeVerifiedPayment(
+  paymentId: string,
+  verification: any,
+) {
+  const paymentRef = db
+    .collection("real_payment_transactions")
+    .doc(paymentId);
+
+  const paymentSnap = await paymentRef.get();
+  if (!paymentSnap.exists) {
+    throw new Error("Real payment transaction was not found.");
+  }
+
+  const payment = paymentSnap.data() ?? {};
+  const applicationId = text(payment.applicationId);
+  const expectedAmount = money(payment.amount);
+  const expectedCurrency = normalizeCurrency(payment.currency);
+  const expectedChargeId = text(payment.chargeId ?? payment.txRef);
+  const verifiedStatus = providerStatus(verification);
+
+  if (!isSuccess(verifiedStatus)) {
+    throw new Error(
+      `Provider payment is not successful: ${verifiedStatus || "unknown"}`,
+    );
+  }
+
+  const verifiedChargeId = providerChargeId(verification);
+  if (
+    verifiedChargeId &&
+    expectedChargeId &&
+    verifiedChargeId !== expectedChargeId
+  ) {
+    throw new Error(
+      "Provider charge ID does not match the MobiFlex transaction.",
+    );
+  }
+
+  const verifiedAmount = providerAmount(verification);
+  const verifiedCurrency = providerCurrency(verification);
+
+  if (verifiedAmount + 0.0001 < expectedAmount) {
+    throw new Error(
+      `Verified amount ${verifiedAmount} is less than expected amount ${expectedAmount}.`,
+    );
+  }
+
+  if (verifiedAmount > expectedAmount + 0.0001) {
+    throw new Error(
+      "Verified payment is greater than the requested financing payment. Controlled refund handling is required before crediting the financing account.",
+    );
+  }
+
+  if (
+    verifiedCurrency &&
+    expectedCurrency &&
+    verifiedCurrency !== expectedCurrency
+  ) {
+    throw new Error(
+      `Provider currency ${verifiedCurrency} does not match expected currency ${expectedCurrency}.`,
+    );
+  }
+
+  if (!applicationId) {
+    throw new Error("Payment transaction has no application ID.");
+  }
+
+  const application = await expireApplicationIfNeeded(
+    applicationId,
+  );
+
+  const state = workflowState(application.data);
+  const depositRequired = money(
+    application.data.requiredDeposit ?? application.data.deposit,
+  );
+  const depositPaidBefore = money(application.data.depositPaid);
+  const depositRemainingBefore = Math.max(
+    0,
+    depositRequired - depositPaidBefore,
+  );
+  const isDepositPayment =
+    ![
+      "FINANCING_ACTIVE",
+      "SALE_COMPLETE",
+      "PAID_OFF",
+    ].includes(state) &&
+    depositRemainingBefore > 0;
+
+  assertTransition(
+    state,
+    isDepositPayment
+      ? ["READY_FOR_DEPOSIT", "DEPOSIT_PENDING", "AGREEMENT_SIGNED"]
+      : ["FINANCING_ACTIVE"],
+    isDepositPayment ? "apply deposit payment" : "apply financing payment",
+  );
+
+  const ledgerRef = db
+    .collection("mobiFlex_real_money_ledger")
+    .doc(paymentId);
+  const paymentRecordRef = db
+    .collection("payments")
+    .doc(paymentId);
+
+  const accountingCountry = normalizeCountry(
+    application.data.country ?? application.data.countryCode,
+  );
+  const accountingCurrency = expectedCurrency;
+  const merchantIdForAccounting = text(
+    application.data.merchantId,
+  );
+  const merchantAccounting = await calculateMerchantAccounting(
+    accountingCountry,
+    accountingCurrency,
+    expectedAmount,
+    application.data,
+    verification,
+  );
+  const merchantAccountingRef = merchantIdForAccounting
+    ? db
+        .collection("merchant_payment_transactions")
+        .doc(paymentId)
+    : null;
+  const merchantBalanceRef = merchantIdForAccounting
+    ? db.collection("merchants").doc(merchantIdForAccounting)
+    : null;
+
+  const applyMerchantAccounting = (
+    transaction: any,
+    existingMerchantAccounting: any,
+  ) => {
+    if (
+      !merchantAccounting ||
+      !merchantAccountingRef ||
+      !merchantBalanceRef ||
+      existingMerchantAccounting?.exists
+    ) {
+      return;
+    }
+
+    const merchantTransactionId = paymentId;
+
+    transaction.set(
+      merchantAccountingRef,
+      {
+        transactionId: merchantTransactionId,
+        paymentId,
+        merchantId: merchantIdForAccounting,
+        customerId: text(payment.customerId) || null,
+        customerUid: text(payment.customerUid) || null,
+        applicationId,
+        country: accountingCountry,
+        currency: accountingCurrency,
+        grossAmount: expectedAmount,
+        providerFee: merchantAccounting.providerFee,
+        providerFeeSource: merchantAccounting.providerFeeSource,
+        merchantFee: merchantAccounting.merchantFee,
+        merchantFeeType: merchantAccounting.merchantFeeType,
+        merchantFeeRate: merchantAccounting.merchantFeeRate,
+        merchantFeeBasis: merchantAccounting.merchantFeeBasis,
+        mobiFlexRevenue: merchantAccounting.mobiFlexRevenue,
+        mobiFlexRevenueType:
+          merchantAccounting.mobiFlexRevenueType,
+        mobiFlexRevenueBasis:
+          merchantAccounting.mobiFlexRevenueBasis,
+        merchantNetAmount: merchantAccounting.merchantNetAmount,
+        settlementStatus: merchantAccounting.settlementStatus,
+        settlementId: null,
+        provider: "paychangu",
+        chargeId: expectedChargeId,
+        providerChargeId:
+          providerChargeId(verification) || expectedChargeId,
+        providerReference:
+          providerReference(verification) || null,
+        paymentStage,
+        verified: true,
+        createdAt:
+          payment.createdAt ?? FieldValue.serverTimestamp(),
+        verifiedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    transaction.set(
+      merchantBalanceRef,
+      {
+        pendingBalance: FieldValue.increment(
+          merchantAccounting.merchantNetAmount,
+        ),
+        merchantPendingBalance: FieldValue.increment(
+          merchantAccounting.merchantNetAmount,
+        ),
+        totalGrossPayments: FieldValue.increment(
+          expectedAmount,
+        ),
+        totalProviderFees: FieldValue.increment(
+          merchantAccounting.providerFee,
+        ),
+        totalMerchantFees: FieldValue.increment(
+          merchantAccounting.merchantFee,
+        ),
+        totalMerchantNetAmount: FieldValue.increment(
+          merchantAccounting.merchantNetAmount,
+        ),
+        totalMobiFlexRevenue: FieldValue.increment(
+          merchantAccounting.mobiFlexRevenue,
+        ),
+        lastPaymentTransactionId: merchantTransactionId,
+        lastPaymentAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  };
+
+  let alreadyApplied = false;
+  let remaining = 0;
+  let paymentStatus = "Pending";
+  let paymentStage = isDepositPayment
+    ? "DEPOSIT_PAYMENT"
+    : "FINANCING_PAYMENT";
+  let saleCompleted = false;
+  let gracePeriodEndsAt: Timestamp | null = null;
+
+  await db.runTransaction(async (transaction) => {
+    const currentPayment = await transaction.get(paymentRef);
+    const currentApplication = await transaction.get(application.ref);
+    const existingLedger = await transaction.get(ledgerRef);
+    const existingMerchantAccounting = merchantAccountingRef
+      ? await transaction.get(merchantAccountingRef)
+      : null;
+    if (merchantBalanceRef) {
+      await transaction.get(merchantBalanceRef);
+    }
+
+    if (existingLedger.exists) {
+      applyMerchantAccounting(
+        transaction,
+        existingMerchantAccounting,
+      );
+      alreadyApplied = true;
+      const ledger = existingLedger.data() ?? {};
+      remaining = money(
+        ledger.newRemaining ??
+          ledger.financingRemainingAmount ??
+          snapshotData(currentApplication).remainingAmount ??
+          0,
+      );
+      paymentStatus = text(ledger.paymentStatus ?? "Pending");
+      paymentStage = text(
+        ledger.paymentStage ?? paymentStage,
+      );
+      saleCompleted = ledger.saleCompleted === true;
+      const graceMillis = timestampToMillis(
+        ledger.gracePeriodEndsAt,
+      );
+      gracePeriodEndsAt =
+        graceMillis > 0
+          ? Timestamp.fromMillis(graceMillis)
+          : null;
+      return;
+    }
+
+    if (currentPayment.data()?.financingApplied === true) {
+      applyMerchantAccounting(
+        transaction,
+        existingMerchantAccounting,
+      );
+      alreadyApplied = true;
+      remaining = money(
+        currentPayment.data()?.remainingAmount ??
+          currentPayment.data()?.financingRemainingAmount ??
+          snapshotData(currentApplication).remainingAmount ??
+          0,
+      );
+      paymentStatus = text(
+        currentPayment.data()?.paymentStatus ?? "Pending",
+      );
+      paymentStage = text(
+        currentPayment.data()?.paymentStage ?? paymentStage,
+      );
+      saleCompleted =
+        currentPayment.data()?.saleCompleted === true;
+      const graceMillis = timestampToMillis(
+        currentPayment.data()?.gracePeriodEndsAt,
+      );
+      gracePeriodEndsAt =
+        graceMillis > 0
+          ? Timestamp.fromMillis(graceMillis)
+          : null;
+      return;
+    }
+
+    const appData = snapshotData(currentApplication);
+
+    if (isDepositPayment) {
+      const currentDepositPaid = money(appData.depositPaid);
+      const currentDepositRequired = money(
+        appData.requiredDeposit ?? appData.deposit,
+      );
+      const newDepositPaid = money(
+        currentDepositPaid + expectedAmount,
+      );
+      const newDepositRemaining = money(
+        Math.max(0, currentDepositRequired - newDepositPaid),
+      );
+
+      const depositComplete = newDepositRemaining <= 0;
+      paymentStage = "DEPOSIT_PAYMENT";
+      paymentStatus = depositComplete ? "Paid" : "Pending";
+      saleCompleted = depositComplete;
+
+      const applicationUpdate: Record<string, unknown> = {
+        depositPaid: newDepositPaid,
+        depositRemaining: newDepositRemaining,
+        depositStatus: depositComplete
+          ? "Paid"
+          : "Pending",
+        lastPaymentId: paymentId,
+        lastPaymentChargeId: expectedChargeId,
+        lastPaymentAmount: expectedAmount,
+        lastPaymentProvider: "paychangu",
+        lastPaymentVerifiedAt: FieldValue.serverTimestamp(),
+        paymentStatus,
+        paymentOverdue: false,
+        isOverdue: false,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (depositComplete) {
+        const graceDays = Math.max(
+          0,
+          Number(
+            appData.gracePeriodDays ??
+              appData.agreementGracePeriodDays ??
+              DEFAULT_GRACE_PERIOD_DAYS,
+          ),
+        );
+        const graceEndsMillis =
+          Date.now() + graceDays * 24 * 60 * 60 * 1000;
+        gracePeriodEndsAt = Timestamp.fromMillis(
+          graceEndsMillis,
+        );
+
+        const totalRepayment = money(
+          appData.totalRepayment ??
+            appData.totalFinancingAmount ??
+            appData.loanAmount,
+        );
+        const existingFinancingRemaining = money(
+          appData.financingRemainingAmount,
+        );
+        const computedFinancingRemaining =
+          existingFinancingRemaining > 0
+            ? existingFinancingRemaining
+            : Math.max(
+                0,
+                totalRepayment > 0
+                  ? totalRepayment - newDepositPaid
+                  : money(appData.remainingAmount),
+              );
+
+        remaining = computedFinancingRemaining;
+        applicationUpdate.saleStatus = "Completed";
+        applicationUpdate.saleCompleted = true;
+        applicationUpdate.saleCompletedAt =
+          FieldValue.serverTimestamp();
+        applicationUpdate.lifecycleState = "FINANCING_ACTIVE";
+        applicationUpdate.workflowState = "FINANCING_ACTIVE";
+        applicationUpdate.status = "Active";
+        applicationUpdate.applicationStatus = "Active";
+        applicationUpdate.financingStatus = "Active";
+        applicationUpdate.financingActivatedAt =
+          FieldValue.serverTimestamp();
+        applicationUpdate.gracePeriodDays = graceDays;
+        applicationUpdate.gracePeriodStartAt =
+          FieldValue.serverTimestamp();
+        applicationUpdate.gracePeriodEndsAt =
+          gracePeriodEndsAt;
+        applicationUpdate.installmentStartAt =
+          gracePeriodEndsAt;
+        applicationUpdate.installmentScheduleStatus =
+          "Scheduled";
+        applicationUpdate.remainingAmount = remaining;
+        applicationUpdate.financingRemainingAmount =
+          remaining;
+        applicationUpdate.depositCompletedAt =
+          FieldValue.serverTimestamp();
+        applicationUpdate.deviceProtectionActive = true;
+        applicationUpdate.completedSaleId =
+          text(appData.saleId) || `SALE-${applicationId}`;
+        applicationUpdate.completedSaleStatus = "Completed";
+      } else {
+        remaining = newDepositRemaining;
+        applicationUpdate.lifecycleState = "DEPOSIT_PENDING";
+        applicationUpdate.workflowState = "DEPOSIT_PENDING";
+        applicationUpdate.applicationStatus = "Deposit Pending";
+      }
+
+      transaction.set(
+        application.ref,
+        applicationUpdate,
+        { merge: true },
+      );
+
+      transaction.set(
+        paymentRef,
+        {
+          status: "verified",
+          providerStatus: verifiedStatus,
+          providerVerification: verification,
+          providerChargeId:
+            verifiedChargeId || expectedChargeId,
+          providerReference:
+            providerReference(verification) || null,
+          verifiedAmount,
+          verifiedCurrency:
+            verifiedCurrency || expectedCurrency,
+          financingApplied: true,
+          paymentStage,
+          remainingAmount: remaining,
+          depositPaid: newDepositPaid,
+          depositRemaining: newDepositRemaining,
+          paymentStatus,
+          saleCompleted,
+          gracePeriodEndsAt,
+          verifiedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      transaction.set(ledgerRef, {
+        paymentId,
+        transactionId: text(payment.txRef),
+        chargeId: expectedChargeId,
+        applicationId,
+        customerId: text(payment.customerId),
+        customerUid: text(payment.customerUid),
+        provider: "paychangu",
+        operator: text(payment.operator),
+        amount: expectedAmount,
+        verifiedAmount,
+        currency: expectedCurrency,
+        providerCurrency:
+          verifiedCurrency || expectedCurrency,
+        previousRemaining: depositRemainingBefore,
+        newRemaining: remaining,
+        paymentStatus,
+        paymentStage,
+        saleCompleted,
+        gracePeriodEndsAt,
+        paymentType: "financing_deposit",
+        verified: true,
+        createdAt:
+          payment.createdAt ?? FieldValue.serverTimestamp(),
+        verifiedAt: FieldValue.serverTimestamp(),
+      });
+
+      transaction.set(paymentRecordRef, {
+        paymentId,
+        transactionId: text(payment.txRef),
+        applicationId,
+        customerId: text(payment.customerId),
+        customerUid: text(payment.customerUid),
+        customerName: text(payment.customerName),
+        phone: text(payment.phone),
+        amount: expectedAmount,
+        verifiedAmount,
+        currency: expectedCurrency,
+        provider: "paychangu",
+        operator: text(payment.operator),
+        chargeId: expectedChargeId,
+        status: "Paid",
+        paymentStage,
+        previousRemaining: depositRemainingBefore,
+        remainingAmount: remaining,
+        depositPaid: newDepositPaid,
+        depositRemaining: newDepositRemaining,
+        saleCompleted,
+        gracePeriodEndsAt,
+        paymentTransactionId: paymentId,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      if (depositComplete) {
+        const saleId =
+          text(appData.saleId) || `SALE-${applicationId}`;
+        const saleRef = db.collection("sales").doc(saleId);
+        transaction.set(saleRef, {
+          saleId,
+          applicationId,
+          merchantId: text(appData.merchantId) || null,
+          agentId: text(appData.agentId) || null,
+          customerId: text(
+            appData.customerId ??
+              appData.customerUid ??
+              appData.userId,
+          ) || null,
+          customerName: text(
+            appData.customerName ?? appData.fullName,
+          ),
+          deviceId: text(appData.deviceId) || null,
+          imei: text(appData.imei) || null,
+          phoneModel: text(appData.phoneModel) || null,
+          country: expectedCurrency === "MWK"
+            ? "MW"
+            : text(appData.country ?? appData.countryCode),
+          currency: expectedCurrency,
+          depositRequired: currentDepositRequired,
+          depositPaid: newDepositPaid,
+          paymentId,
+          status: "Completed",
+          completedAt: FieldValue.serverTimestamp(),
+          createdAt: appData.createdAt ?? FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        const merchantId = text(appData.merchantId);
+        if (merchantId) {
+          transaction.set(
+            db.collection("merchants").doc(merchantId),
+            {
+              completedSalesCount: FieldValue.increment(1),
+              lastCompletedSaleAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        }
+
+        const agentId = text(appData.agentId);
+        if (agentId) {
+          transaction.set(
+            db.collection("agents").doc(agentId),
+            {
+              completedSalesCount: FieldValue.increment(1),
+              lastCompletedSaleAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        }
+      }
+
+      applyMerchantAccounting(
+        transaction,
+        existingMerchantAccounting,
+      );
+
+      return;
+    }
+
+    const oldRemaining = outstandingAmount(appData);
+
+    if (oldRemaining <= 0) {
+      throw new Error(
+        "Application has no remaining financing balance.",
+      );
+    }
+
+    if (expectedAmount > oldRemaining + 0.0001) {
+      throw new Error(
+        "Verified payment is greater than the application's current outstanding balance.",
+      );
+    }
+
+    remaining = money(
+      Math.max(0, oldRemaining - expectedAmount),
+    );
+    paymentStatus = remaining <= 0 ? "Paid" : "Pending";
+    paymentStage = "FINANCING_PAYMENT";
+    saleCompleted = true;
+
+    const applicationUpdate: Record<string, unknown> = {
+      remainingAmount: remaining,
+      financingRemainingAmount: remaining,
+      paymentStatus,
+      paymentOverdue: false,
+      isOverdue: false,
+      lastPaymentId: paymentId,
+      lastPaymentChargeId: expectedChargeId,
+      lastPaymentAmount: expectedAmount,
+      lastPaymentProvider: "paychangu",
+      lastPaymentVerifiedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+
+    if (remaining <= 0) {
+      applicationUpdate.financingStatus = "Paid Off";
+      applicationUpdate.workflowState = "PAID_OFF";
+      applicationUpdate.lifecycleState = "PAID_OFF";
+      applicationUpdate.status = "Completed";
+      applicationUpdate.applicationStatus = "Completed";
+      applicationUpdate.deviceStatus = "Active";
+      applicationUpdate.desiredLockStatus = "Unlocked";
+      applicationUpdate.deviceProtectionActive = true;
+      applicationUpdate.systemIdStatus = "Used";
+      applicationUpdate.phoneAllocationStatus = "Allocated";
+      applicationUpdate.paidOffAt =
+        FieldValue.serverTimestamp();
+    } else {
+      applicationUpdate.financingStatus = "Active";
+      applicationUpdate.workflowState = "FINANCING_ACTIVE";
+      applicationUpdate.lifecycleState = "FINANCING_ACTIVE";
+    }
+
+    transaction.set(
+      application.ref,
+      applicationUpdate,
+      { merge: true },
+    );
+
+    transaction.set(
+      paymentRef,
+      {
+        status: "verified",
+        providerStatus: verifiedStatus,
+        providerVerification: verification,
+        providerChargeId:
+          verifiedChargeId || expectedChargeId,
+        providerReference:
+          providerReference(verification) || null,
+        verifiedAmount,
+        verifiedCurrency:
+          verifiedCurrency || expectedCurrency,
+        financingApplied: true,
+        paymentStage,
+        remainingAmount: remaining,
+        paymentStatus,
+        saleCompleted,
+        verifiedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    transaction.set(ledgerRef, {
+      paymentId,
+      transactionId: text(payment.txRef),
+      chargeId: expectedChargeId,
+      applicationId,
+      customerId: text(payment.customerId),
+      customerUid: text(payment.customerUid),
+      provider: "paychangu",
+      operator: text(payment.operator),
+      amount: expectedAmount,
+      verifiedAmount,
+      currency: expectedCurrency,
+      providerCurrency:
+        verifiedCurrency || expectedCurrency,
+      previousRemaining: oldRemaining,
+      newRemaining: remaining,
+      paymentStatus,
+      paymentStage,
+      saleCompleted,
+      paymentType: "financing_payment",
+      verified: true,
+      createdAt:
+        payment.createdAt ?? FieldValue.serverTimestamp(),
+      verifiedAt: FieldValue.serverTimestamp(),
+    });
+
+    transaction.set(paymentRecordRef, {
+      paymentId,
+      transactionId: text(payment.txRef),
+      applicationId,
+      customerId: text(payment.customerId),
+      customerUid: text(payment.customerUid),
+      customerName: text(payment.customerName),
+      phone: text(payment.phone),
+      amount: expectedAmount,
+      verifiedAmount,
+      currency: expectedCurrency,
+      provider: "paychangu",
+      operator: text(payment.operator),
+      chargeId: expectedChargeId,
+      status: "Paid",
+      paymentStage,
+      previousRemaining: oldRemaining,
+      remainingAmount: remaining,
+      paymentTransactionId: paymentId,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    applyMerchantAccounting(
+      transaction,
+      existingMerchantAccounting,
+    );
+  });
+
+  let deviceCommandId: string | null = null;
+  if (!alreadyApplied) {
+    const shouldSyncDevice =
+      paymentStage === "FINANCING_PAYMENT" || saleCompleted;
+
+    if (shouldSyncDevice) {
+      deviceCommandId = await syncDeviceAfterPayment(
+        applicationId,
+        remaining,
+      );
+    }
+
+    await ledgerRef.set(
+      {
+        deviceCommandId,
+        deviceSyncStatus:
+          !shouldSyncDevice
+            ? "AwaitingDepositCompletion"
+            : remaining <= 0
+              ? deviceCommandId
+                ? "Pending"
+                : "Completed"
+              : "Completed",
+        deviceSyncAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  } else {
+    deviceCommandId = text(
+      (await ledgerRef.get()).data()?.deviceCommandId,
+    ) || null;
+  }
+
+  return {
+    alreadyApplied,
+    paymentId,
+    chargeId: expectedChargeId,
+    amount: expectedAmount,
+    currency: expectedCurrency,
+    remainingAmount: remaining,
+    paymentStatus,
+    paymentStage,
+    saleCompleted,
+    gracePeriodEndsAt,
+    deviceCommandId,
+  };
+}
+
+// ============================================================
+// APPLICATION WORKFLOW API
+// ============================================================
+
+app.get(
+  "/applications/:applicationId/workflow",
+  async (req: Request, res: Response) => {
+    try {
+      const decoded = await verifyBearerToken(req);
+      const application = await expireApplicationIfNeeded(
+        text(req.params.applicationId),
+      );
+      const data = application.data;
+      const applicationCustomerId = text(
+        data.customerId ?? data.customerUid ?? data.userId,
+      );
+
+      const userSnap = await db
+        .collection("users")
+        .doc(decoded.uid)
+        .get();
+      const userData = userSnap.data() ?? {};
+      const role = normalizeRole(
+        userData.role ?? userData.accountType,
+      );
+
+      const staffRoles = new Set([
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "manager",
+        "agent",
+        "sr",
+        "service representative",
+        "service rep",
+      ]);
+
+      let authorized = staffRoles.has(role);
+      if (role === "agent" && text(data.agentId)) {
+        authorized = text(data.agentId) === decoded.uid;
+      }
+      if (!authorized && applicationCustomerId === decoded.uid) {
+        authorized = true;
+      }
+
+      if (!authorized) {
+        return res.status(403).json({
+          success: false,
+          error: "You are not authorized to view this application.",
+        });
+      }
+
+      const state = workflowState(data);
+      return res.status(200).json({
+        success: true,
+        applicationId: application.ref.id,
+        state,
+        status: text(data.status),
+        applicationStatus: text(data.applicationStatus),
+        nextAction: nextWorkflowAction(state),
+        pendingTimeoutMinutes:
+          APPLICATION_PENDING_TIMEOUT_MINUTES,
+        expiresAt: data.expiresAt ?? null,
+        country: applicationCountry(data),
+        currency: applicationCurrency(data),
+        merchantId: text(data.merchantId) || null,
+        agentId: text(data.agentId) || null,
+        customerId: text(data.customerId) || null,
+        imei: text(data.imei) || null,
+        imeiVerified: data.imeiVerified === true,
+        customerPhotoUrl: text(data.customerPhotoUrl) || null,
+        customerSignatureUrl:
+          text(data.customerSignatureUrl) || null,
+        phoneSignatureUrl:
+          text(data.phoneSignatureUrl) || null,
+        deviceReady: data.deviceReady === true,
+        agreementStatus:
+          text(data.agreementStatus) || null,
+        depositStatus: text(data.depositStatus) || null,
+        depositRequired: money(
+          data.requiredDeposit ?? data.deposit,
+        ),
+        depositPaid: money(data.depositPaid),
+        depositRemaining: money(
+          data.depositRemaining ??
+            data.requiredDeposit ??
+            data.deposit,
+        ),
+        saleCompleted: data.saleCompleted === true,
+        gracePeriodDays:
+          numberValue(
+            data.gracePeriodDays ??
+              DEFAULT_GRACE_PERIOD_DAYS,
+          ),
+        gracePeriodEndsAt:
+          data.gracePeriodEndsAt ?? null,
+        financingStatus:
+          text(data.financingStatus) || null,
+        remainingAmount: money(data.remainingAmount),
+        actions: [nextWorkflowAction(state)],
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      const status = message.toLowerCase().includes("token")
+        ? 401
+        : 500;
+      return res.status(status).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/create",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, ["agent"]);
+      const name = text(
+        req.body?.customerName ?? req.body?.fullName ?? req.body?.name,
+      );
+      const phone = text(req.body?.customerPhone ?? req.body?.phone);
+      const merchantId = text(
+        req.body?.merchantId ?? staff.userData.merchantId,
+      );
+      const inventoryId = text(
+        req.body?.phoneInventoryId ?? req.body?.inventoryId,
+      );
+      const country = normalizeCountry(
+        req.body?.country ??
+          req.body?.countryCode ??
+          staff.userData.country ??
+          "MW",
+      );
+      const currency = applicationCurrency({
+        currency:
+          req.body?.currency ?? req.body?.financeCurrency,
+      });
+
+      if (!name || !phone || !merchantId || !inventoryId) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Customer name, customer phone, merchantId and phoneInventoryId are required.",
+        });
+      }
+
+      const staffMerchantId = text(staff.userData.merchantId);
+      if (
+        staffMerchantId &&
+        merchantId &&
+        staffMerchantId !== merchantId
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "Agent is not assigned to the selected Merchant.",
+        });
+      }
+
+      if (!allowedCountryCurrency(country, currency)) {
+        return res.status(400).json({
+          success: false,
+          error: "Country and currency do not match.",
+        });
+      }
+
+      const applicationRef = db.collection("applications").doc();
+      const inventoryRef = db
+        .collection("marketplace_products")
+        .doc(inventoryId);
+      const createdAt = Timestamp.now();
+      const expiresAt = Timestamp.fromMillis(
+        createdAt.toMillis() + APPLICATION_PENDING_TIMEOUT_MS,
+      );
+      const customerId = text(req.body?.customerId);
+      const requiredDeposit = money(
+        req.body?.requiredDeposit ?? req.body?.deposit,
+      );
+
+      const data: Record<string, unknown> = {
+        applicationId: applicationRef.id,
+        customerId: customerId || null,
+        customerUid: customerId || null,
+        customerName: name,
+        fullName: name,
+        customerPhone: phone,
+        phone,
+        merchantId,
+        agentId: staff.uid,
+        agentName: text(staff.userData.name),
+        agentEmail: staff.email,
+        country,
+        countryCode: country,
+        currency,
+        phoneModel: text(req.body?.phoneModel),
+        phoneInventoryId: inventoryId,
+        cashPrice: money(req.body?.cashPrice),
+        totalRepayment: money(
+          req.body?.totalRepayment ?? req.body?.loanAmount,
+        ),
+        loanAmount: money(req.body?.loanAmount),
+        requiredDeposit,
+        deposit: requiredDeposit,
+        depositPaid: 0,
+        depositRemaining: requiredDeposit,
+        depositStatus: "Pending",
+        financingStatus: "Pending",
+        paymentStatus: "Pending",
+        workflowState: "PENDING",
+        lifecycleState: "PENDING",
+        status: "Pending",
+        applicationStatus: "Pending",
+        submittedAt: FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
+        expiresAt,
+        pendingTimeoutMinutes:
+          APPLICATION_PENDING_TIMEOUT_MINUTES,
+        createdBy: staff.uid,
+        createdByRole: "Agent",
+        imeiVerified: false,
+        deviceReady: false,
+        agreementStatus: "Pending",
+        agreementAccepted: false,
+        deviceInstallationStatus: "Pending",
+        deviceCheckInStatus: "Pending",
+        saleCompleted: false,
+        gracePeriodDays: Math.max(
+          0,
+          numberValue(
+            req.body?.gracePeriodDays ??
+              DEFAULT_GRACE_PERIOD_DAYS,
+          ),
+        ),
+        createdAtMs: createdAt.toMillis(),
+        dailyPayment: money(req.body?.dailyPayment),
+        weeklyPayment: money(req.body?.weeklyPayment),
+        monthlyPayment: money(req.body?.monthlyPayment),
+        term: text(req.body?.term),
+        loanPeriodMonths: numberValue(req.body?.loanPeriodMonths),
+        srShare: money(req.body?.srShare),
+        customerSelfieUrl: text(req.body?.customerSelfieUrl),
+        customerKycPhotoUrl: text(req.body?.customerKycPhotoUrl),
+        customerIdPhotoUrl: text(req.body?.customerIdPhotoUrl),
+        customerSignatureUrl: text(req.body?.customerSignatureUrl),
+        termsAccepted: req.body?.termsAccepted === true,
+        termsAndConditions: req.body?.termsAndConditions === true,
+        shopRules: text(req.body?.shopRules),
+        nationalId: text(req.body?.nationalId),
+        address: text(req.body?.address),
+        homeAddress: text(req.body?.homeAddress ?? req.body?.address),
+        dob: text(req.body?.dob),
+        dobYear: numberValue(req.body?.dobYear),
+        gender: text(req.body?.gender),
+        secondaryPhone: text(req.body?.secondaryPhone),
+        incomeSource: text(req.body?.incomeSource),
+        incomeBand: text(req.body?.incomeBand),
+        incomeAmount: money(req.body?.incomeAmount),
+        occupation: text(req.body?.occupation),
+        guarantorName: text(req.body?.guarantorName),
+        guarantorPhone: text(req.body?.guarantorPhone),
+        latitude:
+          req.body?.latitude !== undefined
+            ? numberValue(req.body?.latitude)
+            : null,
+        longitude:
+          req.body?.longitude !== undefined
+            ? numberValue(req.body?.longitude)
+            : null,
+        locationAccuracyMeters:
+          req.body?.locationAccuracyMeters !== undefined
+            ? numberValue(req.body?.locationAccuracyMeters)
+            : null,
+      };
+
+      await db.runTransaction(async (transaction) => {
+        const inventorySnap = await transaction.get(inventoryRef);
+        if (!inventorySnap.exists) {
+          throw new Error("The selected phone no longer exists.");
+        }
+
+        const inventory = inventorySnap.data() ?? {};
+        const inventoryStatus = text(
+          inventory.status ?? inventory.inventoryStatus,
+        ).toLowerCase();
+        const inventoryMerchant = text(
+          inventory.merchantId ?? inventory.ownerMerchantId,
+        );
+
+        if (
+          inventoryMerchant &&
+          inventoryMerchant !== merchantId
+        ) {
+          throw new Error(
+            "The selected phone does not belong to this Merchant.",
+          );
+        }
+
+        if (
+          inventoryStatus &&
+          !["available", "ready"].includes(inventoryStatus)
+        ) {
+          throw new Error(
+            "The selected phone is no longer available.",
+          );
+        }
+
+        transaction.set(applicationRef, data);
+        transaction.set(
+          inventoryRef,
+          {
+            status: "Reserved",
+            inventoryStatus: "Reserved",
+            reservedForApplicationId: applicationRef.id,
+            reservedForCustomerId: customerId || null,
+            reservedForCustomerName: name,
+            reservedForAgentId: staff.uid,
+            reservedAt: FieldValue.serverTimestamp(),
+            allocatedApplicationId: applicationRef.id,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+
+      return res.status(201).json({
+        success: true,
+        applicationId: applicationRef.id,
+        status: "Pending",
+        workflowState: "PENDING",
+        expiresAt: expiresAt.toDate().toISOString(),
+        expiresInMinutes:
+          APPLICATION_PENDING_TIMEOUT_MINUTES,
+        nextAction: "WAIT_FOR_APPROVAL",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return res.status(400).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+// ============================================================
+// MANAGER APPLICATION REVIEW VERIFICATION
+// ============================================================
+
+async function performApplicationReviewVerification(
+  applicationId: string,
+  managerUid: string,
+): Promise<{
+  passed: boolean;
+  checks: Array<{
+    name: string;
+    passed: boolean;
+    message: string;
+  }>;
+  errors: string[];
+}> {
+  const application = await loadApplication(applicationId);
+  const checks: Array<{
+    name: string;
+    passed: boolean;
+    message: string;
+  }> = [];
+  const errors: string[] = [];
+
+  const addCheck = (
+    name: string,
+    passed: boolean,
+    message: string,
+  ): void => {
+    checks.push({ name, passed, message });
+    if (!passed) errors.push(message);
+  };
+
+  await application.ref.set(
+    {
+      reviewVerificationStatus: "PENDING",
+      reviewVerificationPassed: false,
+      reviewVerificationManagerUid: managerUid,
+      reviewVerificationStartedAt: FieldValue.serverTimestamp(),
+      reviewVerificationVersion: "1.0.0",
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  // Required minimum verification window. The delay is not identity proof;
+  // the data-consistency checks below determine PASS or FAIL.
+  await new Promise<void>((resolve) => setTimeout(resolve, 10000));
+
+  const fresh = await loadApplication(applicationId);
+  const current = fresh.data;
+
+  addCheck(
+    "Manager ownership",
+    text(current.claimedBy) === managerUid,
+    "The application is no longer owned by the current Manager.",
+  );
+
+  const customerId = text(
+    current.customerId ?? current.customerUid ?? current.userId,
+  );
+  const customerName = text(
+    current.customerName ?? current.fullName ?? current.name,
+  );
+  const customerPhone = text(
+    current.customerPhone ?? current.phone,
+  );
+  const nationalId = text(
+    current.nationalId ?? current.national_id ?? current.idNumber,
+  );
+  const agentId = text(
+    current.agentId ?? current.createdBy,
+  );
+  const agentName = text(
+    current.agentName ?? current.createdByName,
+  );
+  const country = normalizeCountry(
+    current.country ?? current.countryCode ?? "MW",
+  );
+  const currency = applicationCurrency({
+    currency:
+      current.currency ??
+      current.financeCurrency ??
+      current.loanCurrency,
+  });
+  const phoneModel = text(
+    current.phoneModel ?? current.model,
+  );
+  const inventoryId = text(
+    current.phoneInventoryId ??
+    current.inventoryId ??
+    current.phoneModelId,
+  );
+  const cashPrice = money(
+    current.cashPrice ?? current.sellingPrice,
+  );
+  const totalRepayment = money(
+    current.totalRepayment ??
+    current.loanAmount ??
+    current.cashPrice,
+  );
+  const requiredDeposit = money(
+    current.requiredDeposit ?? current.deposit,
+  );
+  const loanAmount = money(
+    current.loanAmount ??
+    Math.max(0, totalRepayment - requiredDeposit),
+  );
+
+  addCheck(
+    "Customer name",
+    customerName.length >= 2,
+    "Customer name is missing or invalid.",
+  );
+  addCheck(
+    "Customer phone",
+    customerPhone.length >= 5,
+    "Customer phone number is missing or invalid.",
+  );
+  addCheck(
+    "Customer record ID",
+    customerId.length > 0,
+    "Customer record ID is missing.",
+  );
+  addCheck(
+    "National ID",
+    nationalId.length > 0,
+    "National ID is missing.",
+  );
+  addCheck(
+    "Agent",
+    agentId.length > 0 || agentName.length > 0,
+    "The Agent who created this application is missing.",
+  );
+  addCheck(
+    "Country and currency",
+    allowedCountryCurrency(country, currency),
+    "Country and currency do not match the MobiFlex configuration.",
+  );
+  addCheck(
+    "Phone model",
+    phoneModel.length > 0,
+    "Phone model is missing.",
+  );
+  addCheck(
+    "Phone inventory",
+    inventoryId.length > 0,
+    "Phone inventory reference is missing.",
+  );
+  addCheck(
+    "Cash price",
+    cashPrice > 0,
+    "Cash price is missing or invalid.",
+  );
+  addCheck(
+    "Total repayment",
+    totalRepayment > 0,
+    "Total repayment is missing or invalid.",
+  );
+  addCheck(
+    "Required deposit",
+    requiredDeposit >= 0 && requiredDeposit <= totalRepayment + 0.0001,
+    "Required deposit is outside the valid financing range.",
+  );
+  addCheck(
+    "Loan amount",
+    loanAmount > 0,
+    "Loan amount is missing or invalid.",
+  );
+
+  const evidenceUrls = [
+    text(current.customerSelfieUrl),
+    text(current.customerKycPhotoUrl),
+    text(current.customerIdPhotoUrl),
+    text(current.customerSignatureUrl),
+    text(current.idPhotoUrl),
+  ].filter((value) => value.length > 0);
+
+  addCheck(
+    "Customer evidence",
+    evidenceUrls.length > 0 || current.termsAccepted === true,
+    "Customer KYC/evidence or accepted customer terms were not recorded.",
+  );
+
+  if (customerId.length > 0) {
+    try {
+      const customerSnapshot = await db
+        .collection("customers")
+        .doc(customerId)
+        .get();
+      const userCustomerSnapshot = await db
+        .collection("users")
+        .doc(customerId)
+        .get();
+      const customerRecord = {
+        ...(userCustomerSnapshot.data() ?? {}),
+        ...(customerSnapshot.data() ?? {}),
+      };
+      const customerExists =
+        customerSnapshot.exists || userCustomerSnapshot.exists;
+
+      addCheck(
+        "Customer record exists",
+        customerExists,
+        "The linked customer record could not be found.",
+      );
+
+      if (customerExists) {
+        const recordName = text(
+          customerRecord.name ??
+          customerRecord.fullName ??
+          customerRecord.customerName,
+        );
+        const recordPhone = text(
+          customerRecord.phone ?? customerRecord.customerPhone,
+        );
+        const recordNationalId = text(
+          customerRecord.nationalId ?? customerRecord.national_id,
+        );
+        const normalizeReviewPhone = (value: string): string =>
+          value.replace(/[^0-9+]/g, "");
+
+        addCheck(
+          "Customer name consistency",
+          recordName.length === 0 ||
+              recordName.trim().toLowerCase() ===
+                  customerName.trim().toLowerCase(),
+          "Application customer name does not match the linked customer record.",
+        );
+        addCheck(
+          "Customer phone consistency",
+          recordPhone.length === 0 ||
+              normalizeReviewPhone(recordPhone) ===
+                  normalizeReviewPhone(customerPhone),
+          "Application customer phone does not match the linked customer record.",
+        );
+        addCheck(
+          "National ID consistency",
+          recordNationalId.length === 0 || recordNationalId === nationalId,
+          "National ID does not match the linked customer record.",
+        );
+      }
+    } catch (error) {
+      console.error("Manager customer verification error:", error);
+      addCheck(
+        "Customer record check",
+        false,
+        "The linked customer record could not be checked.",
+      );
+    }
+  }
+
+  if (agentId.length > 0) {
+    try {
+      const agentUserSnapshot = await db
+        .collection("users")
+        .doc(agentId)
+        .get();
+      const agentCollectionSnapshot = await db
+        .collection("agents")
+        .doc(agentId)
+        .get();
+      const agentExists =
+        agentUserSnapshot.exists || agentCollectionSnapshot.exists;
+
+      addCheck(
+        "Agent record exists",
+        agentExists,
+        "The Agent record could not be found.",
+      );
+
+      if (agentUserSnapshot.exists) {
+        const agentRecord = agentUserSnapshot.data() ?? {};
+        const role = normalizeRole(
+          agentRecord.role ?? agentRecord.accountType,
+        );
+        addCheck(
+          "Agent role",
+          role === "agent",
+          "The application creator is not an Agent account.",
+        );
+
+        const accountName = text(
+          agentRecord.name ??
+          agentRecord.fullName ??
+          agentRecord.displayName,
+        );
+        addCheck(
+          "Agent identity",
+          agentName.length === 0 ||
+              accountName.length === 0 ||
+              agentName.trim().toLowerCase() ===
+                  accountName.trim().toLowerCase(),
+          "Agent name does not match the stored Agent account.",
+        );
+      }
+    } catch (error) {
+      console.error("Manager Agent verification error:", error);
+      addCheck(
+        "Agent record check",
+        false,
+        "The Agent record could not be checked.",
+      );
+    }
+  }
+
+  if (inventoryId.length > 0) {
+    try {
+      const inventorySnapshot = await db
+        .collection("marketplace_products")
+        .doc(inventoryId)
+        .get();
+
+      addCheck(
+        "Phone inventory exists",
+        inventorySnapshot.exists,
+        "Selected phone inventory record could not be found.",
+      );
+
+      if (inventorySnapshot.exists) {
+        const inventory = inventorySnapshot.data() ?? {};
+        const inventoryModel = text(
+          inventory.phoneModel ??
+          inventory.model ??
+          inventory.name ??
+          inventory.productName,
+        );
+        const inventoryCashPrice = money(
+          inventory.cashPrice ?? inventory.sellingPrice,
+        );
+        const inventoryTotal = money(inventory.totalRepayment);
+        const inventoryDeposit = money(
+          inventory.requiredDeposit ?? inventory.deposit,
+        );
+
+        addCheck(
+          "Phone model match",
+          inventoryModel.length === 0 ||
+              inventoryModel.trim().toLowerCase() ===
+                  phoneModel.trim().toLowerCase(),
+          "Phone model does not match the selected inventory.",
+        );
+        addCheck(
+          "Cash price match",
+          inventoryCashPrice <= 0 ||
+              Math.abs(inventoryCashPrice - cashPrice) < 0.01,
+          "Cash price does not match the selected phone.",
+        );
+        addCheck(
+          "Repayment price match",
+          inventoryTotal <= 0 ||
+              Math.abs(inventoryTotal - totalRepayment) < 0.01,
+          "Total repayment does not match the phone financing configuration.",
+        );
+        addCheck(
+          "Deposit match",
+          inventoryDeposit <= 0 ||
+              Math.abs(inventoryDeposit - requiredDeposit) < 0.01,
+          "Required deposit does not match the phone financing configuration.",
+        );
+      }
+    } catch (error) {
+      console.error("Manager inventory verification error:", error);
+      addCheck(
+        "Phone inventory check",
+        false,
+        "The selected phone inventory could not be checked.",
+      );
+    }
+  }
+
+  if (customerPhone.length > 0) {
+    try {
+      const duplicateSnapshot = await db
+        .collection("applications")
+        .where("customerPhone", "==", customerPhone)
+        .limit(20)
+        .get();
+
+      const activeDuplicate = duplicateSnapshot.docs.some((doc) => {
+        if (doc.id === applicationId) return false;
+        const other = doc.data();
+        const otherState = workflowState(other);
+        const otherStatus = text(
+          other.applicationStatus ?? other.status,
+        ).toLowerCase();
+        return (
+          otherState !== "REJECTED" &&
+          otherState !== "EXPIRED" &&
+          otherStatus !== "rejected" &&
+          otherStatus !== "expired"
+        );
+      });
+
+      addCheck(
+        "Duplicate application",
+        !activeDuplicate,
+        "Another active application exists for this customer phone number.",
+      );
+    } catch (error) {
+      console.error("Manager duplicate verification error:", error);
+      addCheck(
+        "Duplicate application check",
+        false,
+        "The system could not complete the duplicate-application check.",
+      );
+    }
+  }
+
+  const passed = errors.length === 0;
+
+  await fresh.ref.set(
+    {
+      reviewVerificationStatus: passed ? "PASSED" : "FAILED",
+      reviewVerificationPassed: passed,
+      reviewVerificationChecks: checks,
+      reviewVerificationErrors: errors,
+      reviewVerificationFinishedAt: FieldValue.serverTimestamp(),
+      reviewVerificationVersion: "1.0.0",
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+
+  return { passed, checks, errors };
+}
+
+app.post(
+  "/applications/:applicationId/review-verification",
+  async (req: Request, res: Response) => {
+    try {
+      const manager = await verifyStaff(req, ["manager"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await loadApplication(applicationId);
+
+      if (text(application.data.claimedBy) !== manager.uid) {
+        return res.status(403).json({
+          success: false,
+          error: "Claim this application before verification.",
+        });
+      }
+
+      const result = await performApplicationReviewVerification(
+        applicationId,
+        manager.uid,
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        passed: result.passed,
+        verificationStatus: result.passed ? "PASSED" : "FAILED",
+        checks: result.checks,
+        errors: result.errors,
+        minimumVerificationSeconds: 10,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/send-back",
+  async (req: Request, res: Response) => {
+    try {
+      const manager = await verifyStaff(req, ["manager"]);
+      const application = await loadApplication(text(req.params.applicationId));
+
+      if (text(application.data.claimedBy) !== manager.uid) {
+        return res.status(403).json({
+          success: false,
+          error: "You do not own this application review.",
+        });
+      }
+
+      if (
+        text(application.data.reviewVerificationStatus).toUpperCase() !==
+        "FAILED"
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: "The application has not failed verification.",
+        });
+      }
+
+      const storedErrors = Array.isArray(
+        application.data.reviewVerificationErrors,
+      )
+        ? application.data.reviewVerificationErrors.map((value: unknown) =>
+            text(value),
+          )
+        : [];
+
+      const reason =
+        text(req.body?.reason) ||
+        storedErrors.join("; ") ||
+        "Application verification failed.";
+
+      await application.ref.set(
+        {
+          status: "Needs Correction",
+          applicationStatus: "Needs Correction",
+          reviewStatus: "Needs Correction",
+          workflowState: "PENDING",
+          lifecycleState: "PENDING",
+          correctionRequired: true,
+          correctionReason: reason,
+          correctionRequestedBy: manager.uid,
+          correctionRequestedByName: text(
+            manager.userData.name ??
+            manager.userData.fullName ??
+            manager.userData.displayName,
+          ),
+          correctionRequestedAt: FieldValue.serverTimestamp(),
+          claimedBy: FieldValue.delete(),
+          claimedByName: FieldValue.delete(),
+          claimedByEmail: FieldValue.delete(),
+          claimedAt: FieldValue.delete(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId: application.ref.id,
+        status: "Needs Correction",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+app.post(
+  "/applications/:applicationId/approve",
+  async (req: Request, res: Response) => {
+    try {
+      const approver = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "manager",
+      ]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+
+            const managerApproverRole = normalizeRole(
+        approver.userData.role ?? approver.userData.accountType,
+      );
+
+      if (managerApproverRole === "manager") {
+        if (text(application.data.claimedBy) !== approver.uid) {
+          return res.status(403).json({
+            success: false,
+            error: "This application belongs to another Manager.",
+          });
+        }
+
+        if (
+          text(application.data.reviewVerificationStatus).toUpperCase() !==
+          "PASSED"
+        ) {
+          return res.status(409).json({
+            success: false,
+            error: "Manager application verification must PASS before approval.",
+            verificationStatus: text(
+              application.data.reviewVerificationStatus,
+            ),
+            verificationErrors: Array.isArray(
+              application.data.reviewVerificationErrors,
+            )
+              ? application.data.reviewVerificationErrors
+              : [],
+          });
+        }
+      }
+assertTransition(
+        state,
+        ["PENDING"],
+        "approve the application",
+      );
+
+      const managerCommissionAmount =
+        managerApproverRole === "manager"
+            ? money(
+                approver.userData.commissionPerApprovedApplication ??
+                    approver.userData.commissionPerApplication ??
+                    0,
+              )
+            : 0;
+
+      const managerCommissionStatus =
+        managerApproverRole !== "manager"
+            ? "NOT_APPLICABLE"
+            : managerCommissionAmount > 0
+                ? "PENDING"
+                : "NOT_CONFIGURED";
+
+      const managerCommissionRef =
+        managerApproverRole === "manager" &&
+                managerCommissionAmount > 0
+            ? db
+                .collection("manager_commissions")
+                .doc(`${applicationId}_${approver.uid}`)
+            : null;
+
+      await db.runTransaction(async (tx) => {
+        if (managerCommissionRef) {
+          const commissionSnap =
+              await tx.get(managerCommissionRef);
+
+          if (!commissionSnap.exists) {
+            const commissionCurrency = normalizeCurrency(
+              application.data.currency ??
+                approver.userData.currency ??
+                "MWK",
+            );
+
+            const commissionCountry = text(
+              application.data.country ??
+                approver.userData.country ??
+                "",
+            );
+
+            const commissionCountryCode = text(
+              application.data.countryCode ??
+                approver.userData.countryCode ??
+                "",
+            ).toUpperCase();
+
+            tx.set(managerCommissionRef, {
+              commissionId: managerCommissionRef.id,
+              managerUid: approver.uid,
+              managerName: text(
+                approver.userData.name ??
+                  approver.userData.fullName ??
+                  approver.userData.displayName ??
+                  approver.email,
+              ),
+              managerEmail: approver.email,
+              applicationId,
+              applicationPath: application.ref.path,
+              source: "APPLICATION_APPROVAL",
+              event: "MANAGER_APPROVED_APPLICATION",
+              commissionType: "PER_APPROVED_APPLICATION",
+              amount: managerCommissionAmount,
+              currency: commissionCurrency,
+              country: commissionCountry,
+              countryCode: commissionCountryCode,
+              status: "PENDING",
+              payoutManagerUid: approver.uid,
+              payoutAccountRequired: true,
+              scheduledLocalTime: "20:30",
+              approvedBy: approver.uid,
+              approvedByEmail: approver.email,
+              approvedAt: FieldValue.serverTimestamp(),
+              createdAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+        }
+
+        tx.set(
+          application.ref,
+          {
+            status: "Approved",
+            applicationStatus: "Approved",
+            workflowState: "APPROVED",
+            lifecycleState: "APPROVED",
+            approved: true,
+            approvedBy: approver.uid,
+            approvedByEmail: approver.email,
+            approvedAt: FieldValue.serverTimestamp(),
+            managerCommissionAmount,
+            managerCommissionStatus,
+            managerCommissionId:
+              managerCommissionRef?.id ?? null,
+            managerCommissionType:
+              managerCommissionAmount > 0
+                  ? "PER_APPROVED_APPLICATION"
+                  : managerCommissionStatus,
+            deviceStatus: "IMEI Required",
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        workflowState: "APPROVED",
+        nextAction: "ADD_IMEI",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      const status = message.toLowerCase().includes("expired") ? 410 : 400;
+      return res.status(status).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/imei",
+  async (req: Request, res: Response) => {
+    try {
+      const agent = await verifyStaff(req, ["agent"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(state, ["APPROVED"], "add IMEI");
+
+      if (
+        text(application.data.agentId) &&
+        text(application.data.agentId) !== agent.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This application belongs to another Agent.",
+        });
+      }
+
+      const imei = normalizeImei(req.body?.imei);
+      if (imei.length < 14 || imei.length > 16) {
+        return res.status(400).json({
+          success: false,
+          error: "A valid IMEI number is required.",
+        });
+      }
+
+      const duplicateApplication = await db
+        .collection("applications")
+        .where("imei", "==", imei)
+        .limit(1)
+        .get();
+      if (
+        !duplicateApplication.empty &&
+        duplicateApplication.docs[0].id !== applicationId
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This IMEI is already linked to another application.",
+        });
+      }
+
+      const duplicateDevice = await db
+        .collection("devices")
+        .where("imei", "==", imei)
+        .limit(1)
+        .get();
+      if (!duplicateDevice.empty) {
+        const existing = duplicateDevice.docs[0].data();
+        if (text(existing.applicationId) !== applicationId) {
+          return res.status(409).json({
+            success: false,
+            error:
+              "This IMEI is already registered to another device/application.",
+          });
+        }
+      }
+
+      const merchantId = text(application.data.merchantId);
+      const inventoryId = text(
+        application.data.phoneInventoryId ??
+          req.body?.phoneInventoryId,
+      );
+
+      if (inventoryId) {
+        const inventoryRef = db
+          .collection("marketplace_products")
+          .doc(inventoryId);
+        const inventorySnap = await inventoryRef.get();
+        if (inventorySnap.exists) {
+          const inventory = inventorySnap.data() ?? {};
+          const inventoryMerchant = text(
+            inventory.merchantId ?? inventory.ownerMerchantId,
+          );
+          const inventoryStatus = text(
+            inventory.status ?? inventory.inventoryStatus,
+          ).toLowerCase();
+          if (
+            inventoryMerchant &&
+            merchantId &&
+            inventoryMerchant !== merchantId
+          ) {
+            return res.status(403).json({
+              success: false,
+              error:
+                "The selected phone does not belong to this Merchant.",
+            });
+          }
+          if (["sold", "allocated", "unavailable"].includes(inventoryStatus)) {
+            return res.status(409).json({
+              success: false,
+              error: "The selected phone is no longer available.",
+            });
+          }
+        }
+      }
+
+      const updates: Record<string, unknown> = {
+        imei,
+        imeiVerified: true,
+        imeiVerifiedAt: FieldValue.serverTimestamp(),
+        workflowState: "IMEI_VERIFIED",
+        lifecycleState: "IMEI_VERIFIED",
+        status: "Approved",
+        applicationStatus: "IMEI Verified",
+        deviceStatus: "Customer Details Required",
+        customerPhotoUrl: null,
+        customerSignatureUrl: null,
+        phoneSignatureUrl: null,
+        deviceInstallationStatus: "Pending",
+        deviceCheckInStatus: "Pending",
+        deviceReady: false,
+        agreementStatus: "Pending",
+        agreementAccepted: false,
+        depositStatus: "Pending Customer/Device Setup",
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      const batch = db.batch();
+      batch.set(application.ref, updates, { merge: true });
+
+      const deviceRef = duplicateDevice.empty
+        ? db.collection("devices").doc()
+        : duplicateDevice.docs[0].ref;
+      batch.set(
+        deviceRef,
+        {
+          deviceId: text(
+            (duplicateDevice.empty
+              ? null
+              : duplicateDevice.docs[0].data()?.deviceId),
+          ) || deviceRef.id,
+          applicationId,
+          imei,
+          merchantId: merchantId || null,
+          agentUid: agent.uid,
+          country: applicationCountry(application.data),
+          currency: applicationCurrency(application.data),
+          managementStatus: "PENDING_ENROLLMENT",
+          lockPolicy: "FINANCED_DEVICE",
+          desiredLockStatus: "Locked",
+          deviceProtectionActive: false,
+          deviceInstallationStatus: "Pending",
+          deviceReady: false,
+          financingStatus: "Pending",
+          updatedAt: FieldValue.serverTimestamp(),
+          createdAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+      batch.set(
+        application.ref,
+        { deviceId: text(
+          (duplicateDevice.empty
+            ? null
+            : duplicateDevice.docs[0].data()?.deviceId),
+        ) || deviceRef.id },
+        { merge: true },
+      );
+
+      if (inventoryId) {
+        batch.set(
+          db.collection("marketplace_products").doc(inventoryId),
+          {
+            imei,
+            imeiVerified: true,
+            allocatedApplicationId: applicationId,
+            status: "Reserved",
+            inventoryStatus: "Reserved",
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      }
+
+      await batch.commit();
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        imei,
+        imeiVerified: true,
+        workflowState: "IMEI_VERIFIED",
+        nextAction: "CAPTURE_CUSTOMER_PHOTO_AND_SIGNATURE",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/customer-verification",
+  async (req: Request, res: Response) => {
+    try {
+      const agent = await verifyStaff(req, ["agent"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(
+        state,
+        ["IMEI_VERIFIED"],
+        "capture customer verification",
+      );
+
+      if (
+        text(application.data.agentId) &&
+        text(application.data.agentId) !== agent.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This application belongs to another Agent.",
+        });
+      }
+
+      const photoUrl = text(req.body?.customerPhotoUrl);
+      const signatureUrl = text(req.body?.customerSignatureUrl);
+      if (!photoUrl || !signatureUrl) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Customer photo and customer signature are required.",
+        });
+      }
+
+      await application.ref.set(
+        {
+          customerPhotoUrl: photoUrl,
+          customerSignatureUrl: signatureUrl,
+          customerPhotoCapturedAt: FieldValue.serverTimestamp(),
+          customerSignatureCapturedAt:
+            FieldValue.serverTimestamp(),
+          workflowState: "CUSTOMER_VERIFIED",
+          lifecycleState: "CUSTOMER_VERIFIED",
+          applicationStatus: "Customer Verified",
+          deviceStatus: "Ready for Device Setup",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        workflowState: "CUSTOMER_VERIFIED",
+        nextAction: "START_DEVICE_SETUP",
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/device/setup/start",
+  async (req: Request, res: Response) => {
+    try {
+      const agent = await verifyStaff(req, ["agent"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(
+        state,
+        ["CUSTOMER_VERIFIED"],
+        "start device setup",
+      );
+
+      if (
+        text(application.data.agentId) &&
+        text(application.data.agentId) !== agent.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This application belongs to another Agent.",
+        });
+      }
+
+      if (!text(application.data.imei) ||
+          application.data.imeiVerified !== true) {
+        return res.status(400).json({
+          success: false,
+          error: "A verified IMEI is required before device setup.",
+        });
+      }
+
+      await application.ref.set(
+        {
+          workflowState: "DEVICE_INSTALLING",
+          lifecycleState: "DEVICE_INSTALLING",
+          applicationStatus: "Device Installation In Progress",
+          deviceStatus: "Installation In Progress",
+          deviceInstallationStatus: "Installing",
+          deviceCheckInStatus: "Pending",
+          deviceReady: false,
+          deviceSetupStartedAt:
+            FieldValue.serverTimestamp(),
+          setupStartedBy: agent.uid,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      const deviceId = text(application.data.deviceId);
+      if (deviceId) {
+        const deviceQuery = await db
+          .collection("devices")
+          .where("deviceId", "==", deviceId)
+          .limit(1)
+          .get();
+        if (!deviceQuery.empty) {
+          await deviceQuery.docs[0].ref.set(
+            {
+              applicationId,
+              managementStatus: "INSTALLING",
+              deviceInstallationStatus: "Installing",
+              deviceProtectionActive: false,
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        workflowState: "DEVICE_INSTALLING",
+        nextAction: "WAIT_FOR_DEVICE_READY",
+        message:
+          "Connect the phone to mobile data/Wi-Fi and complete MobiFlex Device Agent installation.",
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/device/ready",
+  async (req: Request, res: Response) => {
+    try {
+      const agent = await verifyStaff(req, ["agent"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(
+        state,
+        ["DEVICE_INSTALLING"],
+        "mark device ready",
+      );
+
+      if (
+        text(application.data.agentId) &&
+        text(application.data.agentId) !== agent.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This application belongs to another Agent.",
+        });
+      }
+
+      const deviceId = text(
+        req.body?.deviceId ?? application.data.deviceId,
+      );
+      if (!deviceId) {
+        return res.status(400).json({
+          success: false,
+          error: "deviceId is required for device check-in.",
+        });
+      }
+
+      const deviceQuery = await db
+        .collection("devices")
+        .where("deviceId", "==", deviceId)
+        .limit(1)
+        .get();
+      if (deviceQuery.empty) {
+        return res.status(404).json({
+          success: false,
+          error: "Registered device was not found.",
+        });
+      }
+
+      const deviceDoc = deviceQuery.docs[0];
+      const device = deviceDoc.data();
+      if (
+        text(device.applicationId) &&
+        text(device.applicationId) !== applicationId
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This device belongs to another application.",
+        });
+      }
+
+      // The human shop Agent and the Android Device Agent are
+      // separate identities. Preserve the Android Agent UID.
+      const androidAgentUid = text(
+        device.androidAgentUid ??
+          application.data.androidAgentUid ??
+          device.agentUid,
+      );
+
+      const deviceUpdate: Record<string, unknown> = {
+        applicationId,
+        deviceId,
+        imei: text(application.data.imei),
+        humanAgentUid: agent.uid,
+        managementStatus: "READY",
+        deviceInstallationStatus: "Installed",
+        deviceReady: true,
+        agentConnected: true,
+        heartbeatAt: FieldValue.serverTimestamp(),
+        deviceProtectionActive: true,
+        desiredLockStatus: "Locked",
+        lockPolicy: "FINANCED_DEVICE",
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (androidAgentUid) {
+        deviceUpdate.agentUid = androidAgentUid;
+        deviceUpdate.androidAgentUid = androidAgentUid;
+      }
+
+      await deviceDoc.ref.set(
+        deviceUpdate,
+        { merge: true },
+      );
+
+      const applicationUpdate: Record<string, unknown> = {
+        deviceId,
+        workflowState: "DEVICE_READY",
+        lifecycleState: "DEVICE_READY",
+        applicationStatus: "Device Ready - Agreement Required",
+        deviceStatus: "Ready - Agreement Required",
+        deviceInstallationStatus: "Installed",
+        deviceCheckInStatus: "Connected",
+        deviceReady: true,
+        deviceReadyAt: FieldValue.serverTimestamp(),
+        humanAgentUid: agent.uid,
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      if (androidAgentUid) {
+        applicationUpdate.androidAgentUid = androidAgentUid;
+      }
+
+      await application.ref.set(
+        applicationUpdate,
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        deviceId,
+        workflowState: "DEVICE_READY",
+        nextAction: "CUSTOMER_SIGN_AGREEMENT_ON_PHONE",
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/agreement",
+  async (req: Request, res: Response) => {
+    try {
+      const decoded = await verifyBearerToken(req);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(
+        state,
+        ["DEVICE_READY"],
+        "complete the customer agreement",
+      );
+
+      const customerId = text(
+        application.data.customerId ??
+          application.data.customerUid ??
+          application.data.userId,
+      );
+      const userSnap = await db
+        .collection("users")
+        .doc(decoded.uid)
+        .get();
+      const userData = userSnap.data() ?? {};
+      const role = normalizeRole(
+        userData.role ?? userData.accountType,
+      );
+      const isStaff = [
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "manager",
+        "agent",
+        "sr",
+        "service representative",
+        "service rep",
+      ].includes(role);
+
+      if (isStaff) {
+        if (
+          role === "agent" &&
+          text(application.data.agentId) &&
+          text(application.data.agentId) !== decoded.uid
+        ) {
+          return res.status(403).json({
+            success: false,
+            error: "This application belongs to another Agent.",
+          });
+        }
+      } else if (customerId !== decoded.uid) {
+        return res.status(403).json({
+          success: false,
+          error: "Only the customer linked to this application can sign it.",
+        });
+      }
+
+      const accepted = req.body?.accepted === true;
+      const phoneSignatureUrl = text(
+        req.body?.phoneSignatureUrl ??
+          req.body?.customerSignatureUrl,
+      );
+      if (!accepted || !phoneSignatureUrl) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Customer must accept the agreement and provide a phone signature.",
+        });
+      }
+
+      const agreementId =
+        text(req.body?.agreementId) ||
+        `AGR-${applicationId}`;
+
+      await application.ref.set(
+        {
+          agreementId,
+          agreementAccepted: true,
+          agreementStatus: "Accepted",
+          agreementAcceptedAt: FieldValue.serverTimestamp(),
+          agreementSignedAt: FieldValue.serverTimestamp(),
+          phoneSignatureUrl,
+          phoneSignatureMethod:
+            text(req.body?.signatureMethod) ||
+            "ON_DEVICE",
+          workflowState: "READY_FOR_DEPOSIT",
+          lifecycleState: "READY_FOR_DEPOSIT",
+          applicationStatus: "Ready for Deposit",
+          deviceStatus: "Protected - Deposit Required",
+          depositStatus: "Pending",
+          lockPolicy: "FINANCED_DEVICE",
+          deviceProtectionActive: true,
+          desiredLockStatus: "Locked",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      const deviceId = text(application.data.deviceId);
+      if (deviceId) {
+        const deviceQuery = await db
+          .collection("devices")
+          .where("deviceId", "==", deviceId)
+          .limit(1)
+          .get();
+
+        if (!deviceQuery.empty) {
+          const deviceDoc = deviceQuery.docs[0];
+          const deviceData = deviceDoc.data();
+          const androidAgentUid = text(
+            deviceData.androidAgentUid ??
+              application.data.androidAgentUid ??
+              deviceData.agentUid,
+          );
+
+          const deviceRef = deviceDoc.ref;
+          const pendingCommands = await db
+            .collection("device_commands")
+            .where("deviceId", "==", deviceId)
+            .where("status", "==", "pending")
+            .limit(20)
+            .get();
+
+          const existingLock = pendingCommands.docs.find((doc) => {
+            const d = doc.data();
+            return (
+              text(d.command) === "LOCK_DEVICE" ||
+              text(d.type) === "LOCK_DEVICE"
+            );
+          });
+
+          let commandId = existingLock?.id ?? "";
+
+          if (existingLock && androidAgentUid) {
+            await existingLock.ref.set(
+              {
+                agentUid: androidAgentUid,
+                androidAgentUid,
+                humanAgentUid:
+                  text(application.data.agentId) || null,
+                deviceDocumentId: deviceDoc.id,
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true },
+            );
+          }
+
+          if (!commandId) {
+            const commandRef = db.collection("device_commands").doc();
+            commandId = commandRef.id;
+
+            await commandRef.set({
+              commandId,
+              command: "LOCK_DEVICE",
+              type: "LOCK_DEVICE",
+              status: "pending",
+              deviceId,
+              deviceDocumentId: deviceDoc.id,
+              applicationId,
+              merchantId:
+                text(application.data.merchantId) || null,
+              agentUid: androidAgentUid || null,
+              androidAgentUid: androidAgentUid || null,
+              humanAgentUid:
+                text(application.data.agentId) || null,
+              reason:
+                "MobiFlex device protection activates automatically after the financing agreement is accepted.",
+              requestedBy: decoded.uid,
+              executionConfirmed: false,
+              deviceLockConfirmed: false,
+              deviceUnlockConfirmed: false,
+              physicalStateConfirmed: false,
+              createdAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          }
+
+          await deviceRef.set(
+            {
+              applicationId,
+              desiredLockStatus: "Locked",
+              deviceProtectionActive: true,
+              lockPolicy: "FINANCED_DEVICE",
+              lockCommandId: commandId,
+              lockCommandStatus: "Pending",
+              ...(androidAgentUid
+                ? {
+                    agentUid: androidAgentUid,
+                    androidAgentUid,
+                  }
+                : {}),
+              humanAgentUid:
+                text(application.data.agentId) || null,
+              managementStatus: "READY",
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+
+          await application.ref.set(
+            {
+              lockCommandId: commandId,
+              lockCommandStatus: "Pending",
+              ...(androidAgentUid
+                ? { androidAgentUid }
+                : {}),
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        workflowState: "READY_FOR_DEPOSIT",
+        nextAction: "MAKE_DEPOSIT",
+        depositRequired: money(
+          application.data.requiredDeposit ??
+            application.data.deposit,
+        ),
+        message:
+          "Agreement accepted. The authorized Android Agent has been queued for automatic device protection, and the application is ready for deposit.",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      return res.status(400).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/deposit/prepare",
+  async (req: Request, res: Response) => {
+    try {
+      const agent = await verifyStaff(req, ["agent"]);
+      const applicationId = text(req.params.applicationId);
+      const application = await expireApplicationIfNeeded(
+        applicationId,
+      );
+      const state = workflowState(application.data);
+      assertTransition(
+        state,
+        ["AGREEMENT_SIGNED", "READY_FOR_DEPOSIT", "DEPOSIT_PENDING"],
+        "prepare the deposit",
+      );
+
+      if (
+        text(application.data.agentId) &&
+        text(application.data.agentId) !== agent.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This application belongs to another Agent.",
+        });
+      }
+
+      await application.ref.set(
+        {
+          workflowState: "DEPOSIT_PENDING",
+          lifecycleState: "DEPOSIT_PENDING",
+          applicationStatus: "Deposit Pending",
+          depositStatus: "Pending",
+          depositPreparedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId,
+        workflowState: "DEPOSIT_PENDING",
+        nextAction: "MAKE_DEPOSIT",
+        depositAmount: money(
+          application.data.depositRemaining ??
+            application.data.requiredDeposit ??
+            application.data.deposit,
+        ),
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/applications/:applicationId/reject",
+  async (req: Request, res: Response) => {
+    try {
+      const approver = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "manager",
+      ]);
+      const application = await expireApplicationIfNeeded(
+        text(req.params.applicationId),
+      );
+      const state = workflowState(application.data);
+      assertTransition(state, ["PENDING"], "reject the application");
+
+      await application.ref.set(
+        {
+          workflowState: "REJECTED",
+          lifecycleState: "REJECTED",
+          status: "Rejected",
+          applicationStatus: "Rejected",
+          rejectionReason:
+            text(req.body?.reason) || "Application rejected.",
+          rejectedBy: approver.uid,
+          rejectedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        applicationId: application.ref.id,
+        workflowState: "REJECTED",
+        nextAction: "REVIEW_AND_CREATE_NEW_APPLICATION",
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// CUSTOMER REAL PAYMENT
+// ============================================================
+
+app.post(
+  "/payments/real/customer/mobile-money",
+  async (req: Request, res: Response) => {
+    try {
+      const authenticated = await verifyCustomer(req);
+      const applicationId = text(req.body?.applicationId);
+      const operator = normalizeOperator(req.body?.operator);
+      const amount = money(req.body?.amount);
+
+      if (!applicationId) {
+        return res.status(400).json({
+          success: false,
+          error: "applicationId is required.",
+        });
+      }
+
+      if (!operator) {
+        return res.status(400).json({
+          success: false,
+          error: "Airtel Money or TNM Mpamba is required.",
+        });
+      }
+
+      if (amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Payment amount must be greater than zero.",
+        });
+      }
+
+      let application = await assertApplicationOwner(
+        applicationId,
+        authenticated.customer.ids,
+      );
+
+      application = await expireApplicationIfNeeded(
+        applicationId,
+        application,
+      );
+
+      const currentWorkflow = workflowState(application.data);
+      if (
+        ![
+          "READY_FOR_DEPOSIT",
+          "DEPOSIT_PENDING",
+          "FINANCING_ACTIVE",
+        ].includes(currentWorkflow)
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            `Customer payments are not available while the application workflow is ${currentWorkflow}.`,
+          workflowState: currentWorkflow,
+          nextAction: nextWorkflowAction(currentWorkflow),
+        });
+      }
+
+      const country = applicationCountry(application.data);
+      const currency = applicationCurrency(application.data);
+
+      if (country !== "MW" || currency !== "MWK") {
+        return res.status(501).json({
+          success: false,
+          error:
+            "Real provider integration is not connected for this country/currency yet.",
+        });
+      }
+
+      const outstanding = outstandingAmount(application.data);
+      if (outstanding <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "This application has no outstanding financing balance.",
+        });
+      }
+
+      if (amount > outstanding + 0.0001) {
+        return res.status(400).json({
+          success: false,
+          error: "Payment cannot be greater than the outstanding balance.",
+          outstanding,
+        });
+      }
+
+      const phone = cleanMalawiMobile(
+        authenticated.customer.phone,
+      );
+
+      if (!/^\+265[0-9]{8,9}$/.test(phone)) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Customer phone number is invalid. Use Malawi international format, e.g. +265991234567.",
+        });
+      }
+
+      const operatorInfo = await resolvePayChanguOperator(operator);
+      const txRef = createTransactionId("MFA");
+      const paymentRef = db
+        .collection("real_payment_transactions")
+        .doc();
+
+      await paymentRef.set({
+        paymentId: paymentRef.id,
+        txRef,
+        chargeId: txRef,
+        provider: "paychangu",
+        operator,
+        operatorRefId: operatorInfo.refId,
+        providerName: operatorInfo.providerName,
+        customerId: text(application.data.customerId),
+        customerUid: authenticated.uid,
+        customerName: authenticated.customer.name,
+        customerEmail:
+          authenticated.email || authenticated.customer.email,
+        phone,
+        applicationId,
+        country,
+        currency,
+        amount,
+        workflowStateAtCreation: currentWorkflow,
+        paymentStage:
+          currentWorkflow === "FINANCING_ACTIVE"
+            ? "FINANCING_PAYMENT"
+            : "DEPOSIT_PAYMENT",
+        outstandingAtCreation: outstanding,
+        paymentSource: "CUSTOMER_APP",
+        status: "pending",
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      try {
+        const initialized = await initializePayChanguMobileMoney({
+          mobile: phone,
+          amount,
+          chargeId: txRef,
+          email:
+            authenticated.email || authenticated.customer.email,
+          firstName: firstName(authenticated.customer.name),
+          lastName: lastName(authenticated.customer.name),
+          operatorRefId: operatorInfo.refId,
+        });
+
+        await paymentRef.set(
+          {
+            chargeId: initialized.chargeId,
+            providerResponse: initialized.data,
+            providerStatus: initialized.status,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(201).json({
+          success: true,
+          paymentId: paymentRef.id,
+          merchantReference: txRef,
+          chargeId: initialized.chargeId,
+          amount,
+          currency,
+          country,
+          operator,
+          provider: "paychangu",
+          providerStatus: initialized.status,
+          message:
+            "Payment initiated. Complete the mobile-money authorization on your phone.",
+        });
+      } catch (providerError) {
+        await paymentRef.set(
+          {
+            status: "failed",
+            providerError:
+              providerError instanceof Error
+                ? providerError.message
+                : String(providerError),
+            failedAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        throw providerError;
+      }
+    } catch (error) {
+      console.error("Customer real payment error:", error);
+
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error);
+
+      const normalized = message.toLowerCase();
+
+      if (
+        normalized.includes("authorization token is required") ||
+        normalized.includes("authorization token is empty") ||
+        normalized.includes("invalid token") ||
+        normalized.includes("id token")
+      ) {
+        return res.status(401).json({
+          success: false,
+          error: message,
+        });
+      }
+
+      if (
+        normalized.includes("not authorized") ||
+        normalized.includes("not a customer") ||
+        normalized.includes("customer profile was not found")
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: message,
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+// ============================================================
+// CUSTOMER PAYMENT VERIFICATION
+// ============================================================
+
+app.get(
+  "/payments/real/customer/verify/:paymentId",
+  async (req: Request, res: Response) => {
+    try {
+      const authenticated = await verifyCustomer(req);
+      const paymentId = text(req.params.paymentId);
+
+      const paymentRef = db
+        .collection("real_payment_transactions")
+        .doc(paymentId);
+
+      const paymentSnap = await paymentRef.get();
+      if (!paymentSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Payment transaction not found.",
+        });
+      }
+
+      const payment = paymentSnap.data() ?? {};
+      const sameCustomerUid =
+        text(payment.customerUid) === authenticated.uid;
+      const customerId = text(payment.customerId);
+
+      if (
+        !sameCustomerUid &&
+        (!customerId ||
+          !authenticated.customer.ids.has(customerId))
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "You are not authorized to view this payment.",
+        });
+      }
+
+      if (text(payment.applicationId)) {
+        await assertApplicationOwner(
+          text(payment.applicationId),
+          authenticated.customer.ids,
+        );
+      }
+
+      const chargeId = text(
+        payment.chargeId ?? payment.txRef,
+      );
+
+      const verification = await verifyPayChanguCharge(chargeId);
+      const status = providerStatus(verification);
+
+      if (isSuccess(status)) {
+        const result = await finalizeVerifiedPayment(
+          paymentId,
+          verification,
+        );
+
+        return res.status(200).json({
+          success: true,
+          verified: true,
+          status: "verified",
+          ...result,
+        });
+      }
+
+      if (isFailed(status)) {
+        await paymentRef.set(
+          {
+            status: "failed",
+            providerStatus: status,
+            providerVerification: verification,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(200).json({
+          success: true,
+          verified: false,
+          status: "failed",
+          paymentId,
+          chargeId,
+        });
+      }
+
+      await paymentRef.set(
+        {
+          providerStatus: status || "pending",
+          lastProviderVerification: verification,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        verified: false,
+        status: status || "pending",
+        paymentId,
+        chargeId,
+      });
+    } catch (error) {
+      console.error("Customer verification error:", error);
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// STAFF REAL PAYMENT
+// ============================================================
+
+// ============================================================
+// CUSTOMER PAYMENT HISTORY
+// ============================================================
+
+app.get(
+  "/payments/real/customer/history",
+  async (req: Request, res: Response) => {
+    try {
+      const authenticated = await verifyCustomer(req);
+      const applicationId = text(req.query?.applicationId);
+
+      if (applicationId) {
+        await assertApplicationOwner(
+          applicationId,
+          authenticated.customer.ids,
+        );
+      }
+
+      const snapshot = await db
+        .collection("real_payment_transactions")
+        .where("customerUid", "==", authenticated.uid)
+        .limit(100)
+        .get();
+
+      const payments = snapshot.docs
+        .map((doc) => {
+          const data = doc.data() ?? {};
+
+          const createdAt =
+            data.createdAt &&
+            typeof data.createdAt.toDate === "function"
+              ? data.createdAt.toDate().toISOString()
+              : typeof data.createdAt === "string"
+                ? data.createdAt
+                : null;
+
+          const verifiedAt =
+            data.verifiedAt &&
+            typeof data.verifiedAt.toDate === "function"
+              ? data.verifiedAt.toDate().toISOString()
+              : typeof data.verifiedAt === "string"
+                ? data.verifiedAt
+                : null;
+
+          const updatedAt =
+            data.updatedAt &&
+            typeof data.updatedAt.toDate === "function"
+              ? data.updatedAt.toDate().toISOString()
+              : typeof data.updatedAt === "string"
+                ? data.updatedAt
+                : null;
+
+          return {
+            paymentId: doc.id,
+            applicationId: text(data.applicationId),
+            transactionId: text(data.txRef),
+            merchantReference: text(
+              data.merchantReference ?? data.txRef,
+            ),
+            chargeId: text(data.chargeId),
+            amount: money(data.amount),
+            verifiedAmount: money(data.verifiedAmount),
+            remainingAmount: money(data.remainingAmount),
+            currency: text(data.currency),
+            country: text(data.country),
+            operator: text(data.operator),
+            provider: text(data.provider),
+            providerName: text(data.providerName),
+            providerStatus: text(data.providerStatus),
+            status: text(data.status),
+            paymentStage: text(data.paymentStage),
+            paymentSource: text(data.paymentSource),
+            createdAt,
+            verifiedAt,
+            updatedAt,
+          };
+        })
+        .filter((payment) =>
+          applicationId
+            ? payment.applicationId === applicationId
+            : true,
+        )
+        .sort((a, b) => {
+          const left = a.createdAt
+            ? new Date(a.createdAt).getTime()
+            : 0;
+
+          const right = b.createdAt
+            ? new Date(b.createdAt).getTime()
+            : 0;
+
+          return right - left;
+        });
+
+      return res.status(200).json({
+        success: true,
+        count: payments.length,
+        payments,
+      });
+    } catch (error) {
+      console.error(
+        "Customer payment history error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// STAFF REAL PAYMENT
+// ============================================================
+
+app.post(
+  "/payments/real/mobile-money",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req);
+      const applicationId = text(req.body?.applicationId);
+      const operator = normalizeOperator(req.body?.operator);
+      const amount = money(req.body?.amount);
+
+      const application = await loadApplication(applicationId);
+      const country = applicationCountry(application.data);
+      const currency = applicationCurrency(application.data);
+
+      if (country !== "MW" || currency !== "MWK") {
+        return res.status(501).json({
+          success: false,
+          error:
+            "Real provider integration is not connected for this country/currency yet.",
+        });
+      }
+
+      const outstanding = outstandingAmount(application.data);
+      if (amount <= 0 || amount > outstanding + 0.0001) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid payment amount.",
+          outstanding,
+        });
+      }
+
+      const phone = cleanMalawiMobile(
+        req.body?.phone ??
+          application.data.customerPhone ??
+          application.data.phone,
+      );
+
+      if (!/^\+265[0-9]{8,9}$/.test(phone)) {
+        return res.status(400).json({
+          success: false,
+          error: "A valid Malawi customer phone number is required.",
+        });
+      }
+
+      const operatorInfo = await resolvePayChanguOperator(operator);
+      const txRef = createTransactionId("MFA");
+      const paymentRef = db
+        .collection("real_payment_transactions")
+        .doc();
+
+      await paymentRef.set({
+        paymentId: paymentRef.id,
+        txRef,
+        chargeId: txRef,
+        provider: "paychangu",
+        operator,
+        operatorRefId: operatorInfo.refId,
+        providerName: operatorInfo.providerName,
+        applicationId,
+        customerId: text(application.data.customerId),
+        customerUid: null,
+        customerName: text(
+          application.data.customerName ??
+            application.data.customerFullName,
+        ),
+        customerEmail: text(application.data.customerEmail),
+        phone,
+        country,
+        currency,
+        amount,
+        outstandingAtCreation: outstanding,
+        paymentSource: "STAFF_APP",
+        createdByUid: staff.uid,
+        createdByEmail: staff.email,
+        status: "pending",
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      const initialized = await initializePayChanguMobileMoney({
+        mobile: phone,
+        amount,
+        chargeId: txRef,
+        email: text(application.data.customerEmail),
+        firstName: firstName(
+          text(
+            application.data.customerName ??
+              application.data.customerFullName,
+          ),
+        ),
+        lastName: lastName(
+          text(
+            application.data.customerName ??
+              application.data.customerFullName,
+          ),
+        ),
+        operatorRefId: operatorInfo.refId,
+      });
+
+      await paymentRef.set(
+        {
+          chargeId: initialized.chargeId,
+          providerResponse: initialized.data,
+          providerStatus: initialized.status,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(201).json({
+        success: true,
+        paymentId: paymentRef.id,
+        merchantReference: txRef,
+        chargeId: initialized.chargeId,
+        amount,
+        currency,
+        country,
+        operator,
+        provider: "paychangu",
+        providerStatus: initialized.status,
+      });
+    } catch (error) {
+      console.error("Staff real payment error:", error);
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// STAFF VERIFICATION
+// ============================================================
+
+app.get(
+  "/payments/real/verify/:chargeId",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req);
+      const chargeId = text(req.params.chargeId);
+
+      const query = await db
+        .collection("real_payment_transactions")
+        .where("chargeId", "==", chargeId)
+        .limit(1)
+        .get();
+
+      if (query.empty) {
+        return res.status(404).json({
+          success: false,
+          error: "MobiFlex payment transaction not found.",
+        });
+      }
+
+      const paymentDoc = query.docs[0];
+      const verification = await verifyPayChanguCharge(chargeId);
+      const status = providerStatus(verification);
+
+      if (isSuccess(status)) {
+        const result = await finalizeVerifiedPayment(
+          paymentDoc.id,
+          verification,
+        );
+
+        return res.status(200).json({
+          success: true,
+          verified: true,
+          status: "verified",
+          ...result,
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        verified: false,
+        status: status || "pending",
+        paymentId: paymentDoc.id,
+        chargeId,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// PAYCHANGU WEBHOOK
+// ============================================================
+
+app.post(
+  "/webhooks/paychangu",
+  async (req: Request, res: Response) => {
+    try {
+      if (!PAYCHANGU_WEBHOOK_SECRET) {
+        return res.status(503).json({
+          success: false,
+          error:
+            "PAYCHANGU_WEBHOOK_SECRET is not configured.",
+        });
+      }
+
+      const rawBody =
+        (req as Request & { rawBody?: Buffer }).rawBody ??
+        Buffer.from(JSON.stringify(req.body ?? {}));
+
+      const signature = text(
+        req.headers.signature ??
+          req.headers["x-signature"] ??
+          req.headers["x-webhook-signature"],
+      );
+
+      const expected = crypto
+        .createHmac("sha256", PAYCHANGU_WEBHOOK_SECRET)
+        .update(rawBody)
+        .digest("hex");
+
+      if (
+        !signature ||
+        signature.length !== expected.length ||
+        !crypto.timingSafeEqual(
+          Buffer.from(signature, "utf8"),
+          Buffer.from(expected, "utf8"),
+        )
+      ) {
+        return res.status(401).json({
+          success: false,
+          error: "Invalid webhook signature.",
+        });
+      }
+
+      const body = req.body ?? {};
+      const eventData =
+        body?.data && typeof body.data === "object"
+          ? body.data
+          : body;
+
+      const chargeId = providerChargeId(eventData);
+      const reference = providerReference(eventData);
+      const status = providerStatus(eventData);
+
+      const webhookRef = db
+        .collection("paychangu_webhooks")
+        .doc();
+
+      await webhookRef.set({
+        eventType:
+          text(body.event_type ?? body.event),
+        chargeId: chargeId || null,
+        reference: reference || null,
+        status: status || null,
+        payload: body,
+        receivedAt: FieldValue.serverTimestamp(),
+      });
+
+      let paymentSnap:
+        | QueryDocumentSnapshot<DocumentData>
+        | null = null;
+
+      if (chargeId) {
+        const query = await db
+          .collection("real_payment_transactions")
+          .where("chargeId", "==", chargeId)
+          .limit(1)
+          .get();
+        if (!query.empty) paymentSnap = query.docs[0];
+      }
+
+      if (!paymentSnap && reference) {
+        const query = await db
+          .collection("real_payment_transactions")
+          .where("txRef", "==", reference)
+          .limit(1)
+          .get();
+        if (!query.empty) paymentSnap = query.docs[0];
+      }
+
+      if (!paymentSnap) {
+        await webhookRef.set(
+          {
+            matched: false,
+            processed: false,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        // Acknowledge unknown notifications so PayChangu does not keep retrying.
+        return res.status(200).json({
+          success: true,
+          matched: false,
+        });
+      }
+
+      if (isFailed(status)) {
+        await paymentSnap.ref.set(
+          {
+            status: "failed",
+            providerStatus: status,
+            webhookProcessed: true,
+            webhookProcessedAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        await webhookRef.set(
+          {
+            matched: true,
+            paymentId: paymentSnap.id,
+            processed: true,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(200).json({
+          success: true,
+          matched: true,
+          processed: true,
+          status: "failed",
+        });
+      }
+
+      // Always re-query provider before crediting financing.
+      const verified = await verifyPayChanguCharge(
+        chargeId ||
+          text(
+            paymentSnap.data()?.chargeId,
+          ),
+      );
+      const verifiedStatus = providerStatus(verified);
+
+      if (isSuccess(verifiedStatus)) {
+        const result = await finalizeVerifiedPayment(
+          paymentSnap.id,
+          verified,
+        );
+
+        await webhookRef.set(
+          {
+            matched: true,
+            paymentId: paymentSnap.id,
+            processed: true,
+            verificationStatus: verifiedStatus,
+            result,
+            processedAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(200).json({
+          success: true,
+          matched: true,
+          processed: true,
+          paymentId: paymentSnap.id,
+          result,
+        });
+      }
+
+      await webhookRef.set(
+        {
+          matched: true,
+          paymentId: paymentSnap.id,
+          processed: false,
+          verificationStatus:
+            verifiedStatus || "pending",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        matched: true,
+        processed: false,
+        paymentId: paymentSnap.id,
+        status: verifiedStatus || "pending",
+      });
+    } catch (error) {
+      console.error("PayChangu webhook error:", error);
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// OPERATORS / CAPABILITIES
+// ============================================================
+
+app.get(
+  "/payments/real/operators",
+  async (_req, res) => {
+    try {
+      const operators = await getPayChanguOperators();
+      return res.status(200).json({
+        success: true,
+        country: "MW",
+        currency: "MWK",
+        operators,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+app.get(
+  "/payments/real/capabilities",
+  async (_req, res) => {
+    return res.status(200).json({
+      success: true,
+      countries: [
+        {
+          country: "MW",
+          currency: "MWK",
+          liveMobileMoney: true,
+          provider: "paychangu",
+          operators: ["airtel", "tnm"],
+        },
+        {
+          country: "ZM",
+          currency: "ZMW",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+        {
+          country: "TZ",
+          currency: "TZS",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+        {
+          country: "KE",
+          currency: "KES",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+        {
+          country: "UG",
+          currency: "UGX",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+        {
+          country: "RW",
+          currency: "RWF",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+        {
+          country: "ZA",
+          currency: "ZAR",
+          liveMobileMoney: false,
+          provider: null,
+          message: "Provider integration pending.",
+        },
+      ],
+    });
+  },
+);
+
+// ============================================================
+// CHECKOUT - OPTIONAL PAYCHANGU HOSTED FLOW
+// ============================================================
+
+app.post(
+  "/payments/real/checkout",
+  async (req: Request, res: Response) => {
+    try {
+      const authenticated = await verifyCustomer(req);
+      const applicationId = text(req.body?.applicationId);
+      const amount = money(req.body?.amount);
+
+      if (!applicationId || amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "applicationId and a valid amount are required.",
+        });
+      }
+
+      if (
+        !PAYCHANGU_CHECKOUT_CALLBACK_URL ||
+        !PAYCHANGU_CHECKOUT_RETURN_URL
+      ) {
+        return res.status(503).json({
+          success: false,
+          error:
+            "PayChangu checkout callback/return URLs are not configured.",
+        });
+      }
+
+      const application = await assertApplicationOwner(
+        applicationId,
+        authenticated.customer.ids,
+      );
+
+      const country = applicationCountry(application.data);
+      const currency = applicationCurrency(application.data);
+
+      if (country !== "MW" || currency !== "MWK") {
+        return res.status(501).json({
+          success: false,
+          error:
+            "Hosted checkout is not connected for this country/currency yet.",
+        });
+      }
+
+      const remaining = outstandingAmount(application.data);
+      if (amount > remaining + 0.0001) {
+        return res.status(400).json({
+          success: false,
+          error: "Payment cannot exceed outstanding balance.",
+          outstanding: remaining,
+        });
+      }
+
+      const txRef = createTransactionId("MFC");
+      const paymentRef = db
+        .collection("real_payment_transactions")
+        .doc();
+
+      await paymentRef.set({
+        paymentId: paymentRef.id,
+        txRef,
+        provider: "paychangu",
+        paymentMethod: "checkout",
+        customerUid: authenticated.uid,
+        customerId: text(application.data.customerId),
+        customerName: authenticated.customer.name,
+        customerEmail:
+          authenticated.email || authenticated.customer.email,
+        applicationId,
+        country,
+        currency,
+        amount,
+        outstandingAtCreation: remaining,
+        status: "pending",
+        paymentSource: "CUSTOMER_APP_CHECKOUT",
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      const result = await payChanguRequest("/payment", {
+        method: "POST",
+        body: {
+          amount: amount.toFixed(2),
+          currency: "MWK",
+          tx_ref: txRef,
+          first_name: firstName(authenticated.customer.name),
+          last_name: lastName(authenticated.customer.name),
+          email:
+            authenticated.email || authenticated.customer.email,
+          callback_url: PAYCHANGU_CHECKOUT_CALLBACK_URL,
+          return_url: PAYCHANGU_CHECKOUT_RETURN_URL,
+          meta: JSON.stringify({
+            paymentId: paymentRef.id,
+            applicationId,
+          }),
+          customization: {
+            title: "MobiFlex African Financing Payment",
+            description:
+              `Financing payment for application ${applicationId}`,
+          },
+        },
+      });
+
+      if (!result.response.ok) {
+        await paymentRef.set(
+          {
+            status: "failed",
+            providerError: result.data,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+        throw new Error(
+          `PayChangu checkout initialization failed with HTTP ${result.response.status}.`,
+        );
+      }
+
+      await paymentRef.set(
+        {
+          providerResponse: result.data,
+          providerStatus: providerStatus(result.data),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      const checkoutUrl = text(
+        result.data?.data?.checkout_url ??
+          result.data?.data?.link ??
+          result.data?.checkout_url ??
+          result.data?.link,
+      );
+
+      return res.status(201).json({
+        success: true,
+        paymentId: paymentRef.id,
+        merchantReference: txRef,
+        checkoutUrl: checkoutUrl || null,
+        amount,
+        currency,
+        country,
+        provider: "paychangu",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// BANK SETTLEMENT - CONTROLLED
+// ============================================================
+
+app.post(
+  "/settlements/bank/request",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "finance",
+      ]);
+
+      const amount = money(req.body?.amount);
+      if (amount <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Settlement amount must be greater than zero.",
+        });
+      }
+
+      const ref = db.collection("bank_settlements").doc();
+      await ref.set({
+        settlementId: ref.id,
+        amount,
+        currency: normalizeCurrency(req.body?.currency || "MWK"),
+        bankName: text(req.body?.bankName),
+        bankAccountName: text(req.body?.bankAccountName),
+        bankAccountNumber: text(req.body?.bankAccountNumber),
+        bankUuid: text(req.body?.bankUuid) || null,
+        notes: text(req.body?.notes) || null,
+        status: "Pending Approval",
+        requestedByUid: staff.uid,
+        requestedByEmail: staff.email,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      return res.status(201).json({
+        success: true,
+        settlementId: ref.id,
+        status: "Pending Approval",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+app.post(
+  "/settlements/bank/:settlementId/approve",
+  async (req: Request, res: Response) => {
+    try {
+      const adminUser = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      const settlementId = text(req.params.settlementId);
+      const ref = db
+        .collection("bank_settlements")
+        .doc(settlementId);
+      const snap = await ref.get();
+
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Settlement not found.",
+        });
+      }
+
+      if (text(snap.data()?.status) === "Approved") {
+        return res.status(200).json({
+          success: true,
+          settlementId,
+          status: "Approved",
+          alreadyApproved: true,
+        });
+      }
+
+      await ref.set(
+        {
+          status: "Approved",
+          approvedByUid: adminUser.uid,
+          approvedByEmail: adminUser.email,
+          approvedAt: FieldValue.serverTimestamp(),
+          settlementExecution: "CONTROLLED",
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        settlementId,
+        status: "Approved",
+        message:
+          "Settlement approved. Actual bank transfer execution remains a separate controlled step.",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+app.get(
+  "/settlements/banks",
+  async (_req, res) => {
+    return res.status(200).json({
+      success: true,
+      supportedCurrency: "MWK",
+      message:
+        "Bank settlement is controlled by MobiFlex Finance/Super Admin.",
+    });
+  },
+);
+
+// ============================================================
+// PASSWORD SETUP
+// ============================================================
+
+function createMobiFlexPasswordSetupLink(
+  firebaseLink: string,
+  role = "Manager",
+): string {
+  const parsed = new URL(firebaseLink);
+  const oobCode = parsed.searchParams.get("oobCode");
+  const apiKey = parsed.searchParams.get("apiKey");
+  const lang = parsed.searchParams.get("lang");
+
+  if (!oobCode || !apiKey) {
+    throw new Error(
+      "Firebase password setup link is missing required parameters.",
+    );
+  }
+
+  const params = new URLSearchParams();
+  params.set("mode", "resetpassword");
+  params.set("oobCode", oobCode);
+  params.set("apiKey", apiKey);
+  params.set("role", role);
+  if (lang) params.set("lang", lang);
+
+  return `${MOBIFLEX_HOSTING_URL}?${params.toString()}`;
+}
+
+async function sendPasswordSetupEmail(
+  email: string,
+  name: string,
+  role: string,
+): Promise<string> {
+  const firebaseLink = await auth.generatePasswordResetLink(email);
+  const link = createMobiFlexPasswordSetupLink(
+    firebaseLink,
+    role,
+  );
+  const roleName = displayRole(role);
+
+  await mailTransporter.sendMail({
+    from: MAIL_FROM,
+    to: email,
+    subject:
+      `MobiFlex African ${roleName} Account - Set Your Password`,
+    text: `Hello ${name},\n\nYour MobiFlex African ${roleName} account has been created.\n\nSet your password here:\n${link}\n\nWhatsApp: 0994756002\nEmail: noelmtalika35@gmail.com\n`,
+  });
+
+  return link;
+}
+
+// ============================================================
+// ACCOUNT CREATION
+// ============================================================
+
+app.post(
+  "/admin/accounts/create",
+  async (req: Request, res: Response) => {
+    let createdUid = "";
+
+    try {
+      const superAdmin = await verifySuperAdmin(req);
+      const name = text(req.body?.name);
+      const email = text(req.body?.email).toLowerCase();
+      const phone = text(req.body?.phone);
+      const role = normalizeRole(req.body?.role);
+      const country = text(req.body?.country || "Malawi");
+
+      const countryCode =
+        text(req.body?.countryCode).toUpperCase();
+
+      const currency =
+        normalizeCurrency(req.body?.currency);
+
+      const payrollCountry =
+        text(req.body?.payrollCountry);
+
+      const payrollCountryCode =
+        text(req.body?.payrollCountryCode).toUpperCase();
+
+      const payrollCurrency =
+        normalizeCurrency(req.body?.payrollCurrency);
+
+      const baseSalary =
+        role === "manager"
+          ? Math.max(0, money(req.body?.baseSalary))
+          : 0;
+
+      const commissionPerApprovedApplication =
+        role === "manager"
+          ? Math.max(
+              0,
+              money(req.body?.commissionPerApprovedApplication),
+            )
+          : 0;
+
+      if (!name || !email.includes("@")) {
+        return res.status(400).json({
+          success: false,
+          message: "Name and valid email are required.",
+        });
+      }
+
+      if (![
+  "manager",
+  "agent",
+  "sr",
+  "service representative",
+  "service rep",
+  "shareholder",
+  "investor",
+  "shareholder / investor",
+  "customer service",
+  "customer service staff",
+  "customer support",
+  "support",
+].includes(role)) {
+  return res.status(400).json({
+    success: false,
+    message:
+      "Only Manager, Agent, SR, Shareholder / Investor or Customer Service accounts can be created.",
+  });
+}
+
+      const collection = roleCollection(role);
+      const existing = await auth.getUserByEmail(email).catch((error: any) => {
+        if (error?.code === "auth/user-not-found") return null;
+        throw error;
+      });
+
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: "This email is already registered.",
+        });
+      }
+
+      const user = await auth.createUser({
+        email,
+        displayName: name,
+        emailVerified: false,
+        disabled: false,
+      });
+      createdUid = user.uid;
+
+      const baseData: Record<string, unknown> = {
+        uid: createdUid,
+        name,
+        fullName: name,
+        email,
+        phone,
+        role:
+          role === "service representative" ||
+          role === "service rep"
+            ? "sr"
+            : role,
+        accountType: displayRole(role),
+        country,
+        ...(role === "manager"
+          ? {
+              countryCode,
+              currency,
+              payrollCountry,
+              payrollCountryCode,
+              payrollCurrency,
+              baseSalary,
+              salaryCurrency: currency,
+              commissionPerApprovedApplication,
+              commissionType: "PER_APPROVED_APPLICATION",
+              commissionSource: "MANAGER_APPROVED_APPLICATION",
+              commissionSchedule: "DAILY",
+              commissionPayoutLocalTime: "20:30",
+              commissionStatus: "ACTIVE",
+            }
+          : {}),
+        status: "pending_kyc",
+        accountStatus: "pending_kyc",
+        kycStatus: "pending",
+        verificationStatus: "pending",
+        kycCompleted: false,
+        kycApproved: false,
+        createdBy: superAdmin.uid,
+        createdByEmail: superAdmin.email,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      const batch = db.batch();
+      batch.set(
+        db.collection("users").doc(createdUid),
+        baseData,
+      );
+      batch.set(
+        db.collection(collection).doc(createdUid),
+        baseData,
+      );
+      await batch.commit();
+
+      let passwordSetupEmailSent = false;
+      let passwordSetupLink = "";
+      try {
+        passwordSetupLink = await sendPasswordSetupEmail(
+          email,
+          name,
+          displayRole(role),
+        );
+        passwordSetupEmailSent = true;
+      } catch (mailError) {
+        console.error(
+          "Password setup email failed:",
+          mailError,
+        );
+      }
+
+      return res.status(201).json({
+        success: true,
+        uid: createdUid,
+        name,
+        email,
+        phone,
+        role: baseData.role,
+        country,
+        status: "pending_kyc",
+        accountStatus: "pending_kyc",
+        kycStatus: "pending",
+        passwordSetupEmailSent,
+        passwordSetupLink: passwordSetupLink || null,
+      });
+    } catch (error: any) {
+      if (createdUid) {
+        try {
+          await auth.deleteUser(createdUid);
+        } catch {}
+      }
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to create account.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/managers/create",
+  async (req: Request, res: Response) => {
+    req.body = {
+      ...(req.body ?? {}),
+      role: "Manager",
+    };
+
+    // Keep the legacy endpoint but route it through the same secure checks.
+    let createdUid = "";
+    try {
+      const superAdmin = await verifySuperAdmin(req);
+      const name = text(req.body?.name);
+      const email = text(req.body?.email).toLowerCase();
+      const phone = text(req.body?.phone);
+      const country = text(req.body?.country || "Malawi");
+
+      if (!name || !email.includes("@")) {
+        return res.status(400).json({
+          success: false,
+          message: "Manager name and valid email are required.",
+        });
+      }
+
+      const existing = await auth.getUserByEmail(email).catch((error: any) => {
+        if (error?.code === "auth/user-not-found") return null;
+        throw error;
+      });
+
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: "This manager email is already registered.",
+        });
+      }
+
+      const user = await auth.createUser({
+        email,
+        displayName: name,
+        disabled: false,
+      });
+      createdUid = user.uid;
+
+      const base = {
+        uid: createdUid,
+        name,
+        fullName: name,
+        email,
+        phone,
+        role: "manager",
+        accountType: "Manager",
+        country,
+        status: "pending_kyc",
+        accountStatus: "pending_kyc",
+        kycStatus: "pending",
+        verificationStatus: "pending",
+        kycCompleted: false,
+        kycApproved: false,
+        createdBy: superAdmin.uid,
+        createdByEmail: superAdmin.email,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      const batch = db.batch();
+      batch.set(db.collection("users").doc(createdUid), base);
+      batch.set(db.collection("managers").doc(createdUid), base);
+      await batch.commit();
+
+      return res.status(201).json({
+        success: true,
+        uid: createdUid,
+        role: "manager",
+        status: "pending_kyc",
+      });
+    } catch (error: any) {
+      if (createdUid) {
+        try {
+          await auth.deleteUser(createdUid);
+        } catch {}
+      }
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to create manager account.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/customers/create",
+  async (req: Request, res: Response) => {
+    let createdUid = "";
+    try {
+      const superAdmin = await verifySuperAdmin(req);
+      const name = text(req.body?.name ?? req.body?.fullName);
+      const phone = text(req.body?.phone);
+      const password = String(req.body?.password ?? "");
+      const country = text(req.body?.country || "Malawi");
+
+      if (!name || !phone) {
+        return res.status(400).json({
+          success: false,
+          message: "Customer name and phone are required.",
+        });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: "Customer password must be at least 6 characters.",
+        });
+      }
+
+      const loginPhone = cleanMalawiMobile(phone);
+      const digits = loginPhone.replace(/[^0-9]/g, "");
+      if (!/^\+265[0-9]{8,9}$/.test(loginPhone)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Please enter a valid Malawi phone number.",
+        });
+      }
+
+      const existing = await db
+        .collection("customers")
+        .where("phone", "==", loginPhone)
+        .limit(1)
+        .get();
+      if (!existing.empty) {
+        return res.status(409).json({
+          success: false,
+          message: "A customer with this phone already exists.",
+        });
+      }
+
+      const internalEmail =
+        `customer_${digits}@customer.mobiflex.africa`;
+
+      const existingUser = await auth
+        .getUserByEmail(internalEmail)
+        .catch((error: any) => {
+          if (error?.code === "auth/user-not-found") return null;
+          throw error;
+        });
+
+      if (existingUser) {
+        return res.status(409).json({
+          success: false,
+          message: "A Customer Auth account already exists for this phone.",
+        });
+      }
+
+      const user = await auth.createUser({
+        email: internalEmail,
+        password,
+        displayName: name,
+        emailVerified: true,
+        disabled: false,
+      });
+      createdUid = user.uid;
+
+      const customerData = {
+        uid: createdUid,
+        name,
+        fullName: name,
+        customerName: name,
+        phone: loginPhone,
+        customerPhone: loginPhone,
+        email: internalEmail,
+        country,
+        nationalId: text(req.body?.nationalId),
+        address: text(req.body?.address),
+        district: text(req.body?.district),
+        region: text(req.body?.region),
+        ta: text(req.body?.ta),
+        village: text(req.body?.village),
+        dateOfBirth: text(req.body?.dateOfBirth),
+        role: "customer",
+        accountType: "Customer",
+        status: "Active",
+        accountStatus: "Active",
+        totalApplications: 0,
+        activeApplications: 0,
+        totalPaid: 0,
+        totalOutstanding: 0,
+        createdBy: superAdmin.uid,
+        createdByEmail: superAdmin.email,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      };
+
+      const batch = db.batch();
+      batch.set(
+        db.collection("customers").doc(createdUid),
+        customerData,
+      );
+      batch.set(
+        db.collection("users").doc(createdUid),
+        customerData,
+      );
+      await batch.commit();
+
+      return res.status(201).json({
+        success: true,
+        uid: createdUid,
+        name,
+        phone: loginPhone,
+        country,
+        role: "customer",
+        status: "Active",
+      });
+    } catch (error: any) {
+      if (createdUid) {
+        try {
+          await auth.deleteUser(createdUid);
+        } catch {}
+      }
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to create customer account.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// CUSTOMER LOGIN
+// ============================================================
+
+app.post(
+  "/customer/login",
+  async (req: Request, res: Response) => {
+    try {
+      const phone = text(req.body?.phone);
+      const password = String(req.body?.password ?? "");
+
+      if (!phone || !password) {
+        return res.status(400).json({
+          success: false,
+          message: "Phone number and password are required.",
+        });
+      }
+      if (!FIREBASE_WEB_API_KEY) {
+        return res.status(500).json({
+          success: false,
+          message: "Firebase Web API key is not configured.",
+        });
+      }
+
+      const loginPhone = cleanMalawiMobile(phone);
+      const digits = loginPhone.replace(/[^0-9]/g, "");
+
+      const query = await db
+        .collection("customers")
+        .where("phone", "==", loginPhone)
+        .limit(1)
+        .get();
+
+      if (query.empty) {
+        return res.status(401).json({
+          success: false,
+          message: "Customer account not found.",
+        });
+      }
+
+      const customerDoc = query.docs[0];
+      const customer = customerDoc.data();
+      const uid = text(customer.uid ?? customerDoc.id);
+      const status = text(
+        customer.status ?? customer.accountStatus ?? "Active",
+      ).toLowerCase();
+
+      if (!["active", "approved"].includes(status)) {
+        return res.status(403).json({
+          success: false,
+          message: "Customer account is not active.",
+        });
+      }
+
+      const internalEmail =
+        `customer_${digits}@customer.mobiflex.africa`;
+
+      const response = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            email: internalEmail,
+            password,
+            returnSecureToken: true,
+          }),
+        },
+      );
+
+      const data = await response.json();
+      if (!response.ok) {
+        return res.status(401).json({
+          success: false,
+          message: "Invalid phone number or password.",
+        });
+      }
+
+      if (
+        text(data.localId) &&
+        text(data.localId) !== uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "Customer account verification failed.",
+        });
+      }
+
+      const customToken = await auth.createCustomToken(uid, {
+        role: "customer",
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: "Customer login successful.",
+        uid,
+        token: customToken,
+        idToken: data.idToken ?? null,
+        refreshToken: data.refreshToken ?? null,
+        customer: {
+          uid,
+          name: customer.name ?? customer.fullName ?? "",
+          fullName: customer.fullName ?? customer.name ?? "",
+          phone: customer.phone ?? loginPhone,
+          country: customer.country ?? "Malawi",
+          status: customer.status ?? "Active",
+          role: "customer",
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to login customer.",
+      });
+    }
+  },
+);
+ 
+// ============================================================
+// CUSTOMER SELF-REGISTRATION
+// ============================================================
+const CUSTOMER_REGISTRATION_TTL_MS = 15 * 60 * 1000;
+const CUSTOMER_OTP_TTL_MS = 5 * 60 * 1000;
+const CUSTOMER_OTP_MAX_ATTEMPTS = 5;
+
+const TWILIO_ACCOUNT_SID =
+  process.env.TWILIO_ACCOUNT_SID || "";
+
+const TWILIO_AUTH_TOKEN =
+  process.env.TWILIO_AUTH_TOKEN || "";
+
+const TWILIO_FROM_PHONE =
+  process.env.TWILIO_FROM_PHONE || "";
+
+function generateCustomerOtp(): string {
+  return Math.floor(
+    100000 + Math.random() * 900000,
+  )
+    .toString()
+    .padStart(6, "0");
+}
+
+function hashCustomerOtp(
+  challengeId: string,
+  otp: string,
+): string {
+  return crypto
+    .createHash("sha256")
+    .update(`${challengeId}:${otp}`)
+    .digest("hex");
+}
+async function sendCustomerOtpSms(
+  phone: string,
+  otp: string,
+): Promise<void> {
+  const mode = text(
+    process.env.CUSTOMER_OTP_MODE || "console",
+  )
+    .trim()
+    .toLowerCase();
+
+  // ----------------------------------------------------------
+  // DEVELOPMENT / TEST MODE
+  // No SMS provider and no payment required.
+  // ----------------------------------------------------------
+
+  if (mode === "console") {
+    console.log("");
+    console.log("==============================================");
+    console.log(" MobiFlex African CUSTOMER OTP");
+    console.log("==============================================");
+    console.log(`Phone: ${phone}`);
+    console.log(`OTP: ${otp}`);
+    console.log("Expires: 5 minutes");
+    console.log("==============================================");
+    console.log("");
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // TWILIO SMS MODE
+  // Used later when real SMS credentials are configured.
+  // ----------------------------------------------------------
+
+  if (
+    !TWILIO_ACCOUNT_SID ||
+    !TWILIO_AUTH_TOKEN ||
+    !TWILIO_FROM_PHONE
+  ) {
+    throw new Error(
+      "Customer OTP SMS provider is not configured.",
+    );
+  }
+
+  const body = new URLSearchParams({
+    To: phone,
+    From: TWILIO_FROM_PHONE,
+    Body:
+      `MobiFlex African verification code: ${otp}. ` +
+      `This code expires in 5 minutes.`,
+  });
+
+  const credentials = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`,
+  ).toString("base64");
+
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(
+      TWILIO_ACCOUNT_SID,
+    )}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type":
+          "application/x-www-form-urlencoded",
+      },
+      body,
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      `OTP SMS provider failed: ${errorText}`,
+    );
+  }
+}
+
+// ============================================================
+// CUSTOMER SELF-REGISTRATION
+// ============================================================
+async function findEligibleCustomerForRegistration(
+  phone: string,
+) {
+  const normalizeForLookup = (value: unknown): string => {
+    const raw = text(value).trim();
+
+    if (!raw) {
+      return "";
+    }
+
+    const digits = raw.replace(/\D/g, "");
+
+    if (!digits) {
+      return "";
+    }
+
+    if (digits.startsWith("265")) {
+      return digits.substring(3);
+    }
+
+    if (digits.startsWith("0")) {
+      return digits.substring(1);
+    }
+
+    return digits;
+  };
+
+  const requestedPhone = normalizeForLookup(phone);
+
+  if (!requestedPhone) {
+    return null;
+  }
+
+  // ----------------------------------------------------------
+  // 1. Search customers by the common phone formats first.
+  // ----------------------------------------------------------
+
+  const phoneVariants = new Set<string>();
+
+  const phoneDigits = phone.replace(/\D/g, "");
+
+  if (phone) {
+    phoneVariants.add(phone);
+  }
+
+  if (phoneDigits) {
+    phoneVariants.add(phoneDigits);
+  }
+
+  if (phoneDigits.startsWith("265")) {
+    phoneVariants.add(
+      `0${phoneDigits.substring(3)}`,
+    );
+
+    phoneVariants.add(
+      `+${phoneDigits}`,
+    );
+  }
+
+  if (phone.startsWith("+265")) {
+    phoneVariants.add(
+      `0${phone.substring(4)}`,
+    );
+  }
+
+  const customerDocs = new Map<
+    string,
+    QueryDocumentSnapshot<DocumentData>
+  >();
+
+  for (const phoneVariant of phoneVariants) {
+    const snapshot = await db
+      .collection("customers")
+      .where("phone", "==", phoneVariant)
+      .limit(20)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      customerDocs.set(doc.id, doc);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 2. Also scan active customers and compare normalized
+  //    phone numbers. This handles old phone formats.
+  // ----------------------------------------------------------
+
+  const activeCustomers = await db
+    .collection("customers")
+    .limit(1000)
+    .get();
+
+  for (const doc of activeCustomers.docs) {
+    const data = doc.data();
+
+    const customerPhone = normalizeForLookup(
+      data.phone,
+    );
+
+    if (
+      customerPhone === requestedPhone
+    ) {
+      customerDocs.set(doc.id, doc);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 3. Validate matching customer.
+  // ----------------------------------------------------------
+
+  for (const doc of customerDocs.values()) {
+    const data = doc.data();
+
+    const status = text(
+      data.status ??
+        data.accountStatus ??
+        "Active",
+    ).toLowerCase();
+
+    if (
+      !["active", "approved"].includes(status)
+    ) {
+      continue;
+    }
+
+    let existingAuthUid = "";
+
+    const storedUid = text(data.uid);
+
+    if (
+      storedUid &&
+      storedUid !== doc.id &&
+      storedUid.toLowerCase() !== "firebase uid" &&
+      storedUid.length > 20
+    ) {
+      const existingAuthUser =
+        await auth
+          .getUser(storedUid)
+          .catch(() => null);
+
+      if (existingAuthUser) {
+        existingAuthUid =
+          existingAuthUser.uid;
+      }
+    }
+
+    return {
+      type: "customer",
+      id: doc.id,
+      uid: existingAuthUid,
+      data,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 4. Fallback: search applications using phone formats.
+  // ----------------------------------------------------------
+
+  const applicationDocs = new Map<
+    string,
+    QueryDocumentSnapshot<DocumentData>
+  >();
+
+  for (const phoneVariant of phoneVariants) {
+    const snapshot = await db
+      .collection("applications")
+      .where(
+        "customerPhone",
+        "==",
+        phoneVariant,
+      )
+      .limit(20)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      applicationDocs.set(doc.id, doc);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 5. Also scan applications and compare normalized phone.
+  // ----------------------------------------------------------
+
+  const allApplications = await db
+    .collection("applications")
+    .limit(2000)
+    .get();
+
+  for (const doc of allApplications.docs) {
+    const data = doc.data();
+
+    const applicationPhone =
+      normalizeForLookup(
+        data.customerPhone,
+      );
+
+    if (
+      applicationPhone === requestedPhone
+    ) {
+      applicationDocs.set(doc.id, doc);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 6. Resolve application -> customer.
+  // ----------------------------------------------------------
+
+  for (const applicationDoc of applicationDocs.values()) {
+    const applicationData =
+      applicationDoc.data();
+
+    const customerId = text(
+      applicationData.customerId,
+    );
+
+    if (!customerId) {
+      continue;
+    }
+
+    const customerSnap = await db
+      .collection("customers")
+      .doc(customerId)
+      .get();
+
+    if (!customerSnap.exists) {
+      continue;
+    }
+
+    const customerData =
+      customerSnap.data() ?? {};
+
+    const customerPhone =
+      normalizeForLookup(
+        customerData.phone,
+      );
+
+    if (
+      customerPhone &&
+      customerPhone !== requestedPhone
+    ) {
+      continue;
+    }
+
+    const status = text(
+      customerData.status ??
+        customerData.accountStatus ??
+        "Active",
+    ).toLowerCase();
+
+    if (
+      !["active", "approved"].includes(status)
+    ) {
+      continue;
+    }
+
+    let existingAuthUid = "";
+
+    const storedUid = text(
+      customerData.uid,
+    );
+
+    if (
+      storedUid &&
+      storedUid !== customerId &&
+      storedUid.toLowerCase() !== "firebase uid" &&
+      storedUid.length > 20
+    ) {
+      const existingAuthUser =
+        await auth
+          .getUser(storedUid)
+          .catch(() => null);
+
+      if (existingAuthUser) {
+        existingAuthUid =
+          existingAuthUser.uid;
+      }
+    }
+
+    return {
+      type: "customer",
+      id: customerId,
+      uid: existingAuthUid,
+      data: customerData,
+    };
+  }
+
+  return null;
+}
+
+// ------------------------------------------------------------
+// CUSTOMER REGISTRATION START
+// ------------------------------------------------------------
+
+app.post(
+  "/customer/register/start",
+  async (
+    req: Request,
+    res: Response,
+  ) => {
+    try {
+      const countryInput = text(
+        req.body?.country,
+      );
+
+      const phoneInput = text(
+        req.body?.phone,
+      );
+
+      if (!countryInput || !phoneInput) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Country and phone number are required.",
+        });
+      }
+
+      const country =
+        normalizeCountry(countryInput);
+
+      let phone: string;
+
+      try {
+        phone =
+          normalizeInternationalPhone(
+            phoneInput,
+            country,
+          );
+      } catch (error: any) {
+        return res.status(400).json({
+          success: false,
+          message:
+            error?.message ??
+            "Invalid country or phone number.",
+        });
+      }
+
+      if (
+        !/^\+[1-9][0-9]{7,14}$/.test(phone)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Please enter a valid international phone number.",
+        });
+      }
+
+      const eligible =
+        await findEligibleCustomerForRegistration(
+          phone,
+        );
+
+      if (!eligible) {
+        return res.status(403).json({
+          success: false,
+          eligible: false,
+          message:
+            "This phone number is not registered with an existing MobiFlex customer, contract, or application.",
+        });
+      }
+
+      const uid = text(eligible.uid);
+
+      if (uid) {
+        const existingAuthUser =
+          await auth
+            .getUser(uid)
+            .catch(() => null);
+
+        if (
+          existingAuthUser &&
+          existingAuthUser.disabled === false
+        ) {
+          return res.status(409).json({
+            success: false,
+            alreadyRegistered: true,
+            message:
+              "This customer already has an active login account. Please use Customer Login.",
+          });
+        }
+      }
+
+      const challengeRef = db
+        .collection(
+          "customer_registration_challenges",
+        )
+        .doc();
+
+      await challengeRef.set({
+        challengeId:
+          challengeRef.id,
+
+        phone,
+
+        country,
+
+        customerId:
+          eligible.id,
+
+        customerUid:
+          uid || "",
+
+        status:
+          "ELIGIBLE",
+
+        otpVerified:
+          false,
+
+        otpAttempts:
+          0,
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        expiresAt:
+          Timestamp.fromMillis(
+            Date.now() +
+              CUSTOMER_REGISTRATION_TTL_MS,
+          ),
+
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      return res.status(200).json({
+        success: true,
+        eligible: true,
+        challengeId:
+          challengeRef.id,
+        phone,
+        country,
+        message:
+          "Phone number verified against the MobiFlex customer records. OTP can now be requested.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer registration start error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to start customer registration.",
+      });
+    }
+  },
+);
+
+// ------------------------------------------------------------
+// CUSTOMER REGISTRATION SEND OTP
+// ------------------------------------------------------------
+
+app.post(
+  "/customer/register/send-otp",
+  async (
+    req: Request,
+    res: Response,
+  ) => {
+    try {
+      const challengeId = text(
+        req.body?.challengeId,
+      );
+
+      if (!challengeId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Registration challenge is required.",
+        });
+      }
+
+      const challengeRef = db
+        .collection(
+          "customer_registration_challenges",
+        )
+        .doc(challengeId);
+
+      const challengeSnap =
+        await challengeRef.get();
+
+      if (!challengeSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Registration challenge was not found.",
+        });
+      }
+
+      const challenge =
+        challengeSnap.data() ?? {};
+
+      const expiresAt =
+        challenge.expiresAt as
+          | Timestamp
+          | undefined;
+
+      if (
+        !expiresAt ||
+        expiresAt.toMillis() <
+          Date.now()
+      ) {
+        await challengeRef.set(
+          {
+            status:
+              "EXPIRED",
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          },
+        );
+
+        return res.status(410).json({
+          success: false,
+          message:
+            "Registration challenge has expired. Please start again.",
+        });
+      }
+
+      const phone = text(
+        challenge.phone,
+      );
+
+      if (!phone) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Registration challenge has no phone number.",
+        });
+      }
+
+      const otp =
+        generateCustomerOtp();
+
+      await sendCustomerOtpSms(
+        phone,
+        otp,
+      );
+
+      const otpExpiresAt =
+        Timestamp.fromMillis(
+          Date.now() +
+            CUSTOMER_OTP_TTL_MS,
+        );
+
+      await challengeRef.set(
+        {
+          otpHash:
+            hashCustomerOtp(
+              otp,
+              challengeId,
+            ),
+
+          otpExpiresAt,
+
+          otpAttempts:
+            0,
+
+          otpSentAt:
+            FieldValue.serverTimestamp(),
+
+          status:
+            "OTP_SENT",
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        },
+      );
+
+      return res.status(200).json({
+        success: true,
+        challengeId,
+        phone,
+        expiresInSeconds:
+          300,
+        message:
+          "OTP has been sent to the registered MobiFlex phone number.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer OTP send error:",
+        error,
+      );
+
+      return res.status(503).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to send customer OTP.",
+      });
+    }
+  },
+);
+
+// ------------------------------------------------------------
+// CUSTOMER REGISTRATION VERIFY OTP
+// ------------------------------------------------------------
+
+app.post(
+  "/customer/register/verify-otp",
+  async (
+    req: Request,
+    res: Response,
+  ) => {
+    let createdUid = "";
+
+    try {
+      const challengeId = text(
+        req.body?.challengeId,
+      );
+
+      const otp = text(
+        req.body?.otp,
+      );
+
+      const password = String(
+        req.body?.password ?? "",
+      );
+
+      if (!challengeId || !otp) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Registration challenge and OTP are required.",
+        });
+      }
+
+      if (password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Customer password must be at least 6 characters.",
+        });
+      }
+
+      const challengeRef = db
+        .collection(
+          "customer_registration_challenges",
+        )
+        .doc(challengeId);
+
+      const challengeSnap =
+        await challengeRef.get();
+
+      if (!challengeSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Registration challenge was not found.",
+        });
+      }
+
+      const challenge =
+        challengeSnap.data() ?? {};
+
+      const registrationExpiresAt =
+        challenge.expiresAt as
+          | Timestamp
+          | undefined;
+
+      if (
+        !registrationExpiresAt ||
+        registrationExpiresAt.toMillis() <
+          Date.now()
+      ) {
+        return res.status(410).json({
+          success: false,
+          message:
+            "Registration challenge has expired.",
+        });
+      }
+
+      const otpExpiresAt =
+        challenge.otpExpiresAt as
+          | Timestamp
+          | undefined;
+
+      if (
+        !otpExpiresAt ||
+        otpExpiresAt.toMillis() <
+          Date.now()
+      ) {
+        return res.status(410).json({
+          success: false,
+          message:
+            "OTP has expired. Please request a new OTP.",
+        });
+      }
+
+      const attempts =
+        Number(
+          challenge.otpAttempts ?? 0,
+        );
+
+      if (
+        attempts >=
+        CUSTOMER_OTP_MAX_ATTEMPTS
+      ) {
+        return res.status(429).json({
+          success: false,
+          message:
+            "Too many incorrect OTP attempts. Please start registration again.",
+        });
+      }
+
+      const expectedHash =
+        text(
+          challenge.otpHash,
+        );
+
+      const suppliedHash =
+        hashCustomerOtp(
+          otp,
+          challengeId,
+        );
+
+      if (
+        !expectedHash ||
+        suppliedHash !== expectedHash
+      ) {
+        await challengeRef.set(
+          {
+            otpAttempts:
+              attempts + 1,
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          },
+        );
+
+        return res.status(401).json({
+          success: false,
+          message:
+            "Invalid OTP.",
+          remainingAttempts:
+            Math.max(
+              0,
+              CUSTOMER_OTP_MAX_ATTEMPTS -
+                attempts -
+                1,
+            ),
+        });
+      }
+
+      const phone =
+        text(challenge.phone);
+
+      const country =
+        text(challenge.country);
+
+      const customerId =
+        text(
+          challenge.customerId,
+        );
+
+      const existingUid =
+        text(
+          challenge.customerUid,
+        );
+
+      if (!phone || !customerId) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "Registration challenge is incomplete.",
+        });
+      }
+
+      const customerRef = db
+        .collection("customers")
+        .doc(customerId);
+
+      const customerSnap =
+        await customerRef.get();
+
+      if (!customerSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Existing MobiFlex customer record was not found.",
+        });
+      }
+
+      const customer =
+        customerSnap.data() ?? {};
+
+      const name =
+        text(
+          customer.name ??
+            customer.fullName ??
+            customer.customerName,
+        );
+
+      const digits =
+        phone.replace(
+          /[^0-9]/g,
+          "",
+        );
+
+      const internalEmail =
+        `customer_${digits}@customer.mobiflex.africa`;
+
+      let firebaseUser =
+        existingUid
+          ? await auth
+              .getUser(existingUid)
+              .catch(() => null)
+          : null;
+
+      if (firebaseUser) {
+        if (!firebaseUser.disabled) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "This customer already has an active login account.",
+          });
+        }
+
+        firebaseUser =
+          await auth.updateUser(
+            firebaseUser.uid,
+            {
+              password,
+              email:
+                internalEmail,
+              displayName:
+                name || undefined,
+              disabled:
+                false,
+              emailVerified:
+                true,
+            },
+          );
+      } else {
+        const existingByEmail =
+          await auth
+            .getUserByEmail(
+              internalEmail,
+            )
+            .catch(() => null);
+
+        if (existingByEmail) {
+          return res.status(409).json({
+            success: false,
+            message:
+              "A customer authentication account already exists for this phone.",
+          });
+        }
+
+        firebaseUser =
+          await auth.createUser({
+            email:
+              internalEmail,
+
+            password,
+
+            displayName:
+              name || undefined,
+
+            disabled:
+              false,
+
+            emailVerified:
+              true,
+          });
+
+        createdUid =
+          firebaseUser.uid;
+      }
+
+      const finalUid =
+        firebaseUser.uid;
+
+      const finalCountry =
+        text(customer.country) ||
+        country;
+
+      const customerUpdate = {
+        uid:
+          finalUid,
+
+        phone,
+
+        customerPhone:
+          phone,
+
+        country:
+          finalCountry,
+
+        role:
+          "customer",
+
+        accountType:
+          "Customer",
+
+        status:
+          customer.status ||
+          "Active",
+
+        accountStatus:
+          customer.accountStatus ||
+          "Active",
+
+        customerLoginEnabled:
+          true,
+
+        phoneVerified:
+          true,
+
+        phoneVerifiedAt:
+          FieldValue.serverTimestamp(),
+
+        registrationMethod:
+          "CUSTOMER_SELF_REGISTRATION",
+
+        registrationChallengeId:
+          challengeId,
+
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      };
+
+      const batch =
+        db.batch();
+
+      batch.set(
+        customerRef,
+        customerUpdate,
+        {
+          merge: true,
+        },
+      );
+
+      batch.set(
+        db
+          .collection("users")
+          .doc(finalUid),
+        customerUpdate,
+        {
+          merge: true,
+        },
+      );
+
+      batch.set(
+        challengeRef,
+        {
+          status:
+            "COMPLETED",
+
+          otpVerified:
+            true,
+
+          completedAt:
+            FieldValue.serverTimestamp(),
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        },
+      );
+
+      await batch.commit();
+
+      const customToken =
+        await auth.createCustomToken(
+          finalUid,
+          {
+            role:
+              "customer",
+          },
+        );
+
+      return res.status(200).json({
+        success: true,
+
+        message:
+          "Customer account created successfully.",
+
+        uid:
+          finalUid,
+
+        token:
+          customToken,
+
+        phone,
+
+        country:
+          finalCountry,
+
+        customer: {
+          uid:
+            finalUid,
+
+          name,
+
+          fullName:
+            name,
+
+          phone,
+
+          country:
+            finalCountry,
+
+          status:
+            customer.status ||
+            "Active",
+
+          role:
+            "customer",
+        },
+      });
+    } catch (error: any) {
+      if (createdUid) {
+        try {
+          await auth.deleteUser(
+            createdUid,
+          );
+        } catch {}
+      }
+
+      console.error(
+        "Customer OTP verification error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to complete customer registration.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// KYC REJECTION
+// ============================================================
+
+async function writeKycRejection(
+  req: Request,
+) {
+  const superAdmin =
+    await verifySuperAdmin(req);
+
+  const uid = text(
+    req.body?.uid ??
+    req.body?.managerUid,
+  );
+
+  const reason = text(
+    req.body?.reason,
+  );
+
+  let role =
+    normalizeRole(req.body?.role);
+
+  if (!uid) {
+    throw new Error("uid is required.");
+  }
+
+  if (!reason) {
+    throw new Error(
+      "A rejection reason is required.",
+    );
+  }
+
+  const userRef =
+    db.collection("users").doc(uid);
+
+  const userSnap =
+    await userRef.get();
+
+  if (!userSnap.exists) {
+    throw new Error(
+      "Applicant profile not found.",
+    );
+  }
+
+  const userData =
+    userSnap.data() ?? {};
+
+  if (!role) {
+    role =
+      normalizeRole(userData.role);
+  }
+
+  const kycCollection =
+    roleKycCollection(role);
+
+  const accountCollection =
+    roleCollection(role);
+
+  if (
+    !kycCollection ||
+    !accountCollection
+  ) {
+    throw new Error(
+      "Invalid KYC role.",
+    );
+  }
+
+  const retryDate = new Date(
+    Date.now() +
+      7 * 24 * 60 * 60 * 1000,
+  );
+
+  const rejected = {
+    status: "kyc_rejected",
+
+    accountStatus: "pending_kyc",
+
+    kycStatus: "rejected",
+
+    verificationStatus: "rejected",
+
+    reviewStatus: "rejected",
+
+    identityVerified: false,
+
+    kycCompleted: false,
+
+    kycApproved: false,
+
+    rejectionReason: reason,
+
+    rejectedAt:
+      FieldValue.serverTimestamp(),
+
+    rejectedByUid:
+      superAdmin.uid,
+
+    rejectedByEmail:
+      superAdmin.email,
+
+    reviewedAt:
+      FieldValue.serverTimestamp(),
+
+    reviewedByUid:
+      superAdmin.uid,
+
+    reviewedByEmail:
+      superAdmin.email,
+
+    resubmissionAllowedAt:
+      retryDate,
+
+    retryDate,
+
+    canResubmit: true,
+
+    updatedAt:
+      FieldValue.serverTimestamp(),
+  };
+
+  const batch =
+    db.batch();
+
+  batch.set(
+    userRef,
+    rejected,
+    {
+      merge: true,
+    },
+  );
+
+  batch.set(
+    db
+      .collection(accountCollection)
+      .doc(uid),
+    rejected,
+    {
+      merge: true,
+    },
+  );
+
+  batch.set(
+    db
+      .collection(kycCollection)
+      .doc(uid),
+    rejected,
+    {
+      merge: true,
+    },
+  );
+
+  await batch.commit();
+
+  await db
+    .collection("notifications")
+    .add({
+      uid,
+
+      recipientUid: uid,
+
+      recipientEmail:
+        text(userData.email),
+
+      recipientName:
+        text(
+          userData.name ??
+          userData.fullName,
+        ),
+
+      role,
+
+      title:
+        "KYC Application Rejected",
+
+      message:
+        `Your ${displayRole(role)} KYC application has been rejected. Reason: ${reason}`,
+
+      type: "kyc",
+
+      category: "kyc",
+
+      read: false,
+
+      isRead: false,
+
+      createdAt:
+        FieldValue.serverTimestamp(),
+
+      updatedAt:
+        FieldValue.serverTimestamp(),
+    });
+
+  return {
+    uid,
+
+    role,
+
+    status: "kyc_rejected",
+
+    verificationStatus:
+      "rejected",
+
+    resubmissionAllowedAt:
+      retryDate,
+  };
+}
+
+app.post(
+  "/admin/kyc/reject",
+  async (req, res) => {
+    try {
+      const result =
+        await writeKycRejection(req);
+
+      return res.status(200).json({
+        success: true,
+        ...result,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to reject KYC.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/manager/kyc/reject",
+  async (req, res) => {
+    req.body = {
+      ...(req.body ?? {}),
+
+      role: "manager",
+
+      uid:
+        req.body?.uid ??
+        req.body?.managerUid,
+    };
+
+    try {
+      const result =
+        await writeKycRejection(req);
+
+      return res.status(200).json({
+        success: true,
+
+        managerUid: result.uid,
+
+        ...result,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to reject manager KYC.",
+      });
+    }
+  },
+);
+
+app.get(
+  "/admin/kyc/:role/:uid",
+  async (req, res) => {
+    try {
+      await verifySuperAdmin(req);
+
+      const role =
+        normalizeRole(req.params.role);
+
+      const uid =
+        text(req.params.uid);
+
+      const collection =
+        roleKycCollection(role);
+
+      if (!uid || !collection) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Valid KYC role and UID are required.",
+        });
+      }
+
+      const snap =
+        await db
+          .collection(collection)
+          .doc(uid)
+          .get();
+
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "KYC application not found.",
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+
+        uid,
+
+        role,
+
+        kyc: {
+          id: snap.id,
+          ...snap.data(),
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to load KYC.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// ANDROID AGENT ENROLLMENT / AUTH
+// ============================================================
+
+app.post(
+  "/admin/android-agent/enrollment",
+  async (req, res) => {
+    let createdAgentUid = "";
+
+    try {
+      const superAdmin =
+        await verifySuperAdmin(req);
+
+      const deviceId =
+        text(req.body?.deviceId);
+
+      if (
+        deviceId.length < 3 ||
+        deviceId.length > 128
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Device ID must be between 3 and 128 characters.",
+        });
+      }
+
+      const enrollmentRef =
+        db
+          .collection("device_enrollments")
+          .doc();
+
+      const enrollmentId =
+        enrollmentRef.id;
+
+      const agentUid =
+        `android-agent-${enrollmentId}`;
+
+      createdAgentUid =
+        agentUid;
+
+      const enrollmentSecret =
+        crypto
+          .randomBytes(32)
+          .toString("base64url");
+
+      const secretHash =
+        crypto
+          .createHash("sha256")
+          .update(
+            enrollmentSecret,
+            "utf8",
+          )
+          .digest("hex");
+
+      const expiresAt =
+        new Date(
+          Date.now() +
+            15 * 60 * 1000,
+        );
+
+      await auth.createUser({
+        uid: agentUid,
+
+        displayName:
+          `MobiFlex Android Agent - ${deviceId}`,
+
+        disabled: false,
+      });
+
+      await auth.setCustomUserClaims(
+        agentUid,
+        {
+          role: "Agent",
+
+          agentType:
+            "ANDROID_DEVICE_AGENT",
+
+          deviceId,
+
+          enrollmentId,
+        },
+      );
+
+      await enrollmentRef.set({
+        enrollmentId,
+
+        deviceId,
+
+        agentUid,
+
+        status: "pending",
+
+        country:
+          text(
+            req.body?.country ||
+            "Malawi",
+          ),
+
+        merchantId:
+          text(
+            req.body?.merchantId,
+          ) || null,
+
+        applicationId:
+          text(
+            req.body?.applicationId,
+          ) || null,
+
+        secretHash,
+
+        authAttempts: 0,
+
+        maxAuthAttempts: 5,
+
+        expiresAt,
+
+        createdBy:
+          superAdmin.uid,
+
+        createdByEmail:
+          superAdmin.email,
+
+        agentType:
+          "ANDROID_DEVICE_AGENT",
+
+        managementMode:
+          "MOBIFLEX_MANAGED",
+
+        notes:
+          text(
+            req.body?.notes,
+          ) || null,
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      await db
+        .collection("users")
+        .doc(agentUid)
+        .set({
+          uid: agentUid,
+
+          role: "Agent",
+
+          agentType:
+            "ANDROID_DEVICE_AGENT",
+
+          accountStatus: "active",
+
+          status: "active",
+
+          country:
+            text(
+              req.body?.country ||
+              "Malawi",
+            ),
+
+          deviceId,
+
+          enrollmentId,
+
+          merchantId:
+            text(
+              req.body?.merchantId,
+            ) || null,
+
+          applicationId:
+            text(
+              req.body?.applicationId,
+            ) || null,
+
+          managementMode:
+            "MOBIFLEX_MANAGED",
+
+          createdBy:
+            superAdmin.uid,
+
+          createdAt:
+            FieldValue.serverTimestamp(),
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        });
+
+      if (
+        text(
+          req.body?.applicationId,
+        )
+      ) {
+        await db
+          .collection("applications")
+          .doc(
+            text(
+              req.body?.applicationId,
+            ),
+          )
+          .set(
+            {
+              androidAgentEnrollmentId:
+                enrollmentId,
+
+              androidAgentUid:
+                agentUid,
+
+              androidAgentDeviceId:
+                deviceId,
+
+              androidAgentStatus:
+                "enrollment_pending",
+
+              managementMode:
+                "MOBIFLEX_MANAGED",
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+            },
+            {
+              merge: true,
+            },
+          );
+      }
+
+      return res.status(201).json({
+        success: true,
+
+        message:
+          "Android Agent enrollment created successfully.",
+
+        enrollment: {
+          enrollmentId,
+
+          deviceId,
+
+          agentUid,
+
+          country:
+            text(
+              req.body?.country ||
+              "Malawi",
+            ),
+
+          merchantId:
+            text(
+              req.body?.merchantId,
+            ) || null,
+
+          applicationId:
+            text(
+              req.body?.applicationId,
+            ) || null,
+
+          status: "pending",
+
+          expiresAt:
+            expiresAt.toISOString(),
+
+          agentType:
+            "ANDROID_DEVICE_AGENT",
+
+          managementMode:
+            "MOBIFLEX_MANAGED",
+        },
+
+        enrollmentSecret,
+      });
+    } catch (error: any) {
+      if (createdAgentUid) {
+        try {
+          await auth.deleteUser(
+            createdAgentUid,
+          );
+        } catch {}
+      }
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Failed to create Android Agent enrollment.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/authenticateAndroidAgent",
+  async (req, res) => {
+    try {
+      const enrollmentId =
+        text(req.body?.enrollmentId);
+
+      const enrollmentSecret =
+        text(
+          req.body?.enrollmentSecret,
+        );
+
+      const deviceId =
+        text(req.body?.deviceId);
+
+      if (
+        !enrollmentId ||
+        !enrollmentSecret ||
+        !deviceId
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Enrollment ID, secret and device ID are required.",
+        });
+      }
+
+      const enrollmentRef =
+        db
+          .collection("device_enrollments")
+          .doc(enrollmentId);
+
+      const snap =
+        await enrollmentRef.get();
+
+      if (!snap.exists) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Invalid Android Agent enrollment.",
+        });
+      }
+
+      const enrollment =
+        snap.data() ?? {};
+
+      if (
+        text(
+          enrollment.status,
+        ).toLowerCase() !==
+        "pending"
+      ) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "This Android Agent enrollment is no longer available.",
+        });
+      }
+
+      if (
+        text(enrollment.deviceId) !==
+        deviceId
+      ) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Android Agent device verification failed.",
+        });
+      }
+
+      const expiresAt =
+        enrollment.expiresAt;
+
+      let expiresAtMillis = 0;
+
+      if (
+        expiresAt instanceof Timestamp
+      ) {
+        expiresAtMillis =
+          expiresAt.toMillis();
+      } else if (
+        expiresAt instanceof Date
+      ) {
+        expiresAtMillis =
+          expiresAt.getTime();
+      } else if (
+        typeof expiresAt ===
+        "number"
+      ) {
+        expiresAtMillis =
+          expiresAt;
+      } else if (
+        typeof expiresAt ===
+        "string"
+      ) {
+        expiresAtMillis =
+          new Date(
+            expiresAt,
+          ).getTime();
+      }
+
+      if (
+        !expiresAtMillis ||
+        expiresAtMillis <=
+          Date.now()
+      ) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Android Agent enrollment has expired.",
+        });
+      }
+
+      const stored =
+        Buffer.from(
+          text(
+            enrollment.secretHash,
+          ),
+          "hex",
+        );
+
+      const supplied =
+        Buffer.from(
+          crypto
+            .createHash("sha256")
+            .update(
+              enrollmentSecret,
+              "utf8",
+            )
+            .digest("hex"),
+          "hex",
+        );
+
+      if (
+        stored.length === 0 ||
+        stored.length !==
+          supplied.length ||
+        !crypto.timingSafeEqual(
+          stored,
+          supplied,
+        )
+      ) {
+        await enrollmentRef.set(
+          {
+            authAttempts:
+              numberValue(
+                enrollment.authAttempts,
+              ) + 1,
+
+            lastAuthAttemptAt:
+              FieldValue.serverTimestamp(),
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          },
+        );
+
+        return res.status(401).json({
+          success: false,
+          message:
+            "Invalid Android Agent enrollment credentials.",
+        });
+      }
+
+      const agentUid =
+        text(enrollment.agentUid);
+
+      const firebaseUser =
+        await auth.getUser(
+          agentUid,
+        );
+
+      const customToken =
+        await auth.createCustomToken(
+          agentUid,
+          {
+            role: "Agent",
+
+            agentType:
+              "ANDROID_DEVICE_AGENT",
+
+            deviceId,
+
+            enrollmentId,
+          },
+        );
+
+      await db.runTransaction(
+        async (transaction) => {
+          const latest =
+            await transaction.get(
+              enrollmentRef,
+            );
+
+          if (!latest.exists) {
+            throw new Error(
+              "Android Agent enrollment no longer exists.",
+            );
+          }
+
+          if (
+            text(
+              latest.data()?.status,
+            ).toLowerCase() !==
+            "pending"
+          ) {
+            throw new Error(
+              "Android Agent enrollment has already been used.",
+            );
+          }
+
+          transaction.set(
+            enrollmentRef,
+            {
+              status: "used",
+
+              usedAt:
+                FieldValue.serverTimestamp(),
+
+              authenticatedDeviceId:
+                deviceId,
+
+              authenticatedUid:
+                agentUid,
+
+              lastAuthAt:
+                FieldValue.serverTimestamp(),
+
+              updatedAt:
+                FieldValue.serverTimestamp(),
+            },
+            {
+              merge: true,
+            },
+          );
+        },
+      );
+
+      await db
+        .collection("users")
+        .doc(agentUid)
+        .set(
+          {
+            androidAgentAuthenticated:
+              true,
+
+            androidAgentDeviceId:
+              deviceId,
+
+            androidAgentEnrollmentId:
+              enrollmentId,
+
+            androidAgentLastAuthenticatedAt:
+              FieldValue.serverTimestamp(),
+
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          },
+        );
+
+      return res.status(200).json({
+        success: true,
+
+        message:
+          "Android Agent authentication successful.",
+
+        customToken,
+
+        uid: agentUid,
+
+        deviceId,
+
+        enrollmentId,
+
+        role: "Agent",
+
+        agentType:
+          "ANDROID_DEVICE_AGENT",
+
+        agent: {
+          uid: agentUid,
+
+          deviceId,
+
+          enrollmentId,
+
+          role: "Agent",
+
+          agentType:
+            "ANDROID_DEVICE_AGENT",
+
+          displayName:
+            firebaseUser.displayName ??
+            "",
+
+          email:
+            firebaseUser.email ??
+            "",
+        },
+      });
+    } catch (error: any) {
+      return res.status(401).json({
+        success: false,
+        message:
+          error?.message ??
+          "Android Agent authentication failed.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// LEGACY AIR-TEL COMPATIBILITY
+// ============================================================
+
+app.post(
+  "/airtel/payment-request",
+  async (
+    req: Request,
+    res: Response,
+  ) => {
+    try {
+      // Route now uses the same real PayChangu collection contract.
+      req.body = {
+        ...(req.body ?? {}),
+        operator: "airtel",
+      };
+
+      const applicationId =
+        text(
+          req.body?.applicationId,
+        );
+
+      const amount =
+        money(req.body?.amount);
+
+      const application =
+        await loadApplication(
+          applicationId,
+        );
+
+      const remaining =
+        outstandingAmount(
+          application.data,
+        );
+
+      if (
+        amount <= 0 ||
+        amount >
+          remaining + 0.0001
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid payment amount.",
+          remainingAmount:
+            remaining,
+        });
+      }
+
+      const phone =
+        cleanMalawiMobile(
+          req.body?.phone ??
+            application.data.customerPhone,
+        );
+
+      const operatorInfo =
+        await resolvePayChanguOperator(
+          "airtel",
+        );
+
+      const txRef =
+        createTransactionId(
+          "MFA",
+        );
+
+      const paymentRef =
+        db
+          .collection(
+            "real_payment_transactions",
+          )
+          .doc();
+
+      await paymentRef.set({
+        paymentId:
+          paymentRef.id,
+
+        txRef,
+
+        chargeId: txRef,
+
+        provider:
+          "paychangu",
+
+        operator:
+          "airtel",
+
+        operatorRefId:
+          operatorInfo.refId,
+
+        providerName:
+          operatorInfo.providerName,
+
+        applicationId,
+
+        customerId:
+          text(
+            req.body?.customerId ??
+              application.data.customerId,
+          ),
+
+        customerName:
+          text(
+            req.body?.customerName ??
+              application.data.customerName,
+          ),
+
+        phone,
+
+        country:
+          applicationCountry(
+            application.data,
+          ),
+
+        currency:
+          applicationCurrency(
+            application.data,
+          ),
+
+        amount,
+
+        outstandingAtCreation:
+          remaining,
+
+        paymentSource:
+          "LEGACY_AIRTEL_COMPATIBILITY",
+
+        status:
+          "pending",
+
+        createdAt:
+          FieldValue.serverTimestamp(),
+
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      const initialized =
+        await initializePayChanguMobileMoney({
+          mobile: phone,
+
+          amount,
+
+          chargeId: txRef,
+
+          email:
+            text(
+              application.data.customerEmail,
+            ),
+
+          firstName:
+            firstName(
+              text(
+                application.data.customerName,
+              ),
+            ),
+
+          lastName:
+            lastName(
+              text(
+                application.data.customerName,
+              ),
+            ),
+
+          operatorRefId:
+            operatorInfo.refId,
+        });
+
+      await paymentRef.set(
+        {
+          chargeId:
+            initialized.chargeId,
+
+          providerResponse:
+            initialized.data,
+
+          providerStatus:
+            initialized.status,
+
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        },
+      );
+
+      return res.status(201).json({
+        success: true,
+
+        paymentRequestId:
+          paymentRef.id,
+
+        paymentId:
+          paymentRef.id,
+
+        transactionId:
+          txRef,
+
+        airtelTransactionId:
+          initialized.chargeId,
+
+        chargeId:
+          initialized.chargeId,
+
+        status:
+          initialized.status,
+
+        message:
+          "Airtel Money payment initiated through PayChangu.",
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to create Airtel payment request.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/airtel/payment-status",
+  async (
+    req: Request,
+    res: Response,
+  ) => {
+    try {
+      await verifyStaff(req);
+
+      const paymentRequestId =
+        text(
+          req.body?.paymentRequestId,
+        );
+
+      const transactionId =
+        text(
+          req.body?.transactionId,
+        );
+
+      let paymentSnap:
+        | QueryDocumentSnapshot<DocumentData>
+        | null = null;
+
+      if (paymentRequestId) {
+        const snap =
+          await db
+            .collection(
+              "real_payment_transactions",
+            )
+            .doc(paymentRequestId)
+            .get();
+
+        if (snap.exists) {
+          paymentSnap =
+            snap as QueryDocumentSnapshot<DocumentData>;
+        }
+      } else if (transactionId) {
+        const query =
+          await db
+            .collection(
+              "real_payment_transactions",
+            )
+            .where(
+              "txRef",
+              "==",
+              transactionId,
+            )
+            .limit(1)
+            .get();
+
+        if (!query.empty) {
+          paymentSnap =
+            query.docs[0];
+        }
+      }
+
+      if (!paymentSnap) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Payment request not found.",
+        });
+      }
+
+      const payment =
+        paymentSnap.data() ?? {};
+
+      const chargeId =
+        text(
+          payment.chargeId ??
+            payment.txRef,
+        );
+
+      const verification =
+        await verifyPayChanguCharge(
+          chargeId,
+        );
+
+      return res.status(200).json({
+        success: true,
+
+        source:
+          "paychangu",
+
+        payment: {
+          id: paymentSnap.id,
+          ...payment,
+        },
+
+        providerVerification:
+          verification,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to check payment status.",
+      });
+    }
+  },
+);
+
+// Old callback endpoint is retained only as a compatibility shim.
+// Real PayChangu callbacks must use /webhooks/paychangu with HMAC validation.
+
+app.post(
+  "/airtel/callback",
+  async (
+    _req,
+    res,
+  ) => {
+    return res.status(410).json({
+      success: false,
+      message:
+        "Legacy Airtel callback is disabled. Configure PayChangu webhook at /webhooks/paychangu.",
+    });
+  },
+);
+
+app.post(
+  "/payment/confirm",
+  async (
+    req,
+    res,
+  ) => {
+    try {
+      if (
+        !MANUAL_PAYMENT_CONFIRM_ENABLED
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Manual payment confirmation is disabled. Use provider verification.",
+        });
+      }
+
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+        "finance",
+      ]);
+
+      const paymentId =
+        text(
+          req.body?.paymentRequestId,
+        );
+
+      const ref =
+        db
+          .collection(
+            "real_payment_transactions",
+          )
+          .doc(paymentId);
+
+      const snap =
+        await ref.get();
+
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Payment transaction not found.",
+        });
+      }
+
+      const chargeId =
+        text(
+          snap.data()?.chargeId ??
+            snap.data()?.txRef,
+        );
+
+      const verification =
+        await verifyPayChanguCharge(
+          chargeId,
+        );
+
+      const status =
+        providerStatus(
+          verification,
+        );
+
+      if (!isSuccess(status)) {
+        return res.status(200).json({
+          success: true,
+          verified: false,
+          status,
+        });
+      }
+
+      const result =
+        await finalizeVerifiedPayment(
+          paymentId,
+          verification,
+        );
+
+      return res.status(200).json({
+        success: true,
+        verified: true,
+        ...result,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to confirm payment.",
+      });
+    }
+  },
+);
+// ============================================================
+// CUSTOMER SERVICE ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â VERIFICATION START
+// ============================================================
+
+app.post(
+  "/customer-service/customer/verification/start",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const customerId = text(req.body?.customerId);
+
+      if (!customerId) {
+        return res.status(400).json({
+          success: false,
+          message: "Customer ID is required.",
+        });
+      }
+
+      const customerSnap = await db
+        .collection("customers")
+        .doc(customerId)
+        .get();
+
+      if (!customerSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Customer not found.",
+        });
+      }
+
+      const customer = customerSnap.data() ?? {};
+
+      const role = normalizeRole(
+        customer.role ?? "customer",
+      );
+
+      if (
+        role !== "customer" &&
+        role !== "customer user"
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "The selected account is not a customer account.",
+        });
+      }
+
+      const status = text(
+        customer.status ??
+          customer.accountStatus ??
+          "active",
+      )
+        .trim()
+        .toLowerCase();
+
+      if (
+        [
+          "disabled",
+          "blocked",
+          "inactive",
+          "suspended",
+          "rejected",
+        ].includes(status)
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "This customer account is not active.",
+        });
+      }
+
+      const verificationId =
+        generateCustomerServiceVerificationId();
+
+      const challenge =
+        generateCustomerServiceChallenge();
+
+      const expiresAt =
+        Date.now() +
+        CUSTOMER_SERVICE_VERIFICATION_TTL_MS;
+
+      await db
+        .collection("customer_service_verifications")
+        .doc(verificationId)
+        .set({
+          verificationId,
+          challenge,
+          staffUid: staff.uid,
+          staffEmail: staff.email,
+          customerId,
+          status: "pending",
+          expiresAt,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+      return res.status(201).json({
+        success: true,
+        verified: false,
+        verificationId,
+        status: "pending",
+        expiresInSeconds:
+          CUSTOMER_SERVICE_VERIFICATION_TTL_MS /
+          1000,
+        message:
+          "Verification challenge created. Customer confirmation is required before protected information can be viewed.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service verification start error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to start customer verification.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// CUSTOMER SERVICE ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â VERIFICATION CONFIRM
+// ============================================================
+
+app.post(
+  "/customer-service/customer/verify",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const verificationId = text(
+        req.body?.verificationId,
+      );
+
+      const customerId = text(
+        req.body?.customerId,
+      );
+
+      if (!verificationId || !customerId) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Verification ID and customer ID are required.",
+        });
+      }
+
+      const verificationRef = db
+        .collection("customer_service_verifications")
+        .doc(verificationId);
+
+      const verificationSnap =
+        await verificationRef.get();
+
+      if (!verificationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message:
+            "Verification session was not found.",
+        });
+      }
+
+      const verification =
+        verificationSnap.data() ?? {};
+
+      if (
+        text(verification.staffUid) !== staff.uid
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "This verification session belongs to another staff member.",
+        });
+      }
+
+      if (
+        text(verification.customerId) !== customerId
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Customer verification mismatch.",
+        });
+      }
+
+      if (
+        text(verification.status) !== "pending"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "This verification session is no longer pending.",
+        });
+      }
+
+      const expiresAt = Number(
+        verification.expiresAt ?? 0,
+      );
+
+      if (
+        !expiresAt ||
+        Date.now() > expiresAt
+      ) {
+        await verificationRef.set(
+          {
+            status: "expired",
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(400).json({
+          success: false,
+          message:
+            "The verification session has expired.",
+        });
+      }
+
+      /*
+       * IMPORTANT:
+       *
+       * This route does NOT accept a random text value
+       * as proof of identity.
+       *
+       * The customer-side confirmation mechanism will
+       * complete the challenge in the next integration
+       * step.
+       */
+
+      return res.status(409).json({
+        success: false,
+        verified: false,
+        verificationId,
+        status: "customer_confirmation_required",
+        message:
+          "Customer confirmation has not been completed yet.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service verification error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to verify customer.",
+      });
+    }
+  },
+);
+// ============================================================
+
+// ============================================================
+// MANAGER PAYROLL PAYOUT ACCOUNT
+// ============================================================
+
+function maskPayoutValue(value: unknown): string {
+  const v = text(value);
+  if (!v) return "";
+  if (v.length <= 4) return `****${v}`;
+  return `****${v.slice(-4)}`;
+}
+
+app.get(
+  "/manager/payroll/payout-account",
+  async (req: Request, res: Response) => {
+    try {
+      const manager = await verifyBearerToken(req);
+      const ref = db.collection("manager_payout_accounts").doc(manager.uid);
+      const snap = await ref.get();
+
+      if (!snap.exists) {
+        return res.status(200).json({
+          success: true,
+          account: null,
+        });
+      }
+
+      const data = snap.data() ?? {};
+      return res.status(200).json({
+        success: true,
+        account: {
+          managerUid: manager.uid,
+          country: text(data.country),
+          currency: normalizeCurrency(data.currency),
+          method: text(data.method).toUpperCase(),
+          accountName: text(data.accountName),
+          bankName: text(data.bankName),
+          branchCode: text(data.branchCode),
+          sortCode: text(data.sortCode),
+          providerName: text(data.providerName),
+          maskedAccountNumber: maskPayoutValue(data.accountNumber),
+          maskedPhoneNumber: maskPayoutValue(data.phoneNumber),
+          status: text(data.status) || "PENDING",
+          rejectionReason: text(data.rejectionReason) || null,
+          verifiedAt: data.verifiedAt ?? null,
+          updatedAt: data.updatedAt ?? null,
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message ?? "Unable to load payout account.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/manager/payroll/payout-account",
+  async (req: Request, res: Response) => {
+    try {
+      const manager = await verifyBearerToken(req);
+      const userSnap = await db.collection("users").doc(manager.uid).get();
+
+      if (!userSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Manager profile was not found.",
+        });
+      }
+
+      const role = normalizeRole(
+        userSnap.data()?.role ?? userSnap.data()?.accountType,
+      );
+      if (role !== "manager") {
+        return res.status(403).json({
+          success: false,
+          message: "Only a Manager can manage a Manager payout account.",
+        });
+      }
+
+      const profileCountry = normalizeCountry(
+        userSnap.data()?.country ?? userSnap.data()?.countryCode,
+      );
+      const country = normalizeCountry(
+        req.body?.country || profileCountry,
+      ) || profileCountry;
+      const currency = normalizeCurrency(
+        req.body?.currency ?? userSnap.data()?.currency ?? "",
+      );
+      const method = text(req.body?.method).toUpperCase();
+      const accountName = text(req.body?.accountName);
+
+      if (!country || country.length !== 2) {
+        return res.status(400).json({
+          success: false,
+          message: "A valid 2-letter country code is required.",
+        });
+      }
+      if (!currency || currency.length !== 3) {
+        return res.status(400).json({
+          success: false,
+          message: "A valid 3-letter currency code is required.",
+        });
+      }
+      if (!["BANK", "MOBILE_MONEY"].includes(method)) {
+        return res.status(400).json({
+          success: false,
+          message: "Payout method must be BANK or MOBILE_MONEY.",
+        });
+      }
+      if (!accountName) {
+        return res.status(400).json({
+          success: false,
+          message: "Account name is required.",
+        });
+      }
+
+      const ref = db.collection("manager_payout_accounts").doc(manager.uid);
+      const previousSnap = await ref.get();
+      const previous = previousSnap.exists ? previousSnap.data() ?? {} : {};
+
+      let accountNumber = text(req.body?.accountNumber);
+      let phoneNumber = text(req.body?.phoneNumber);
+      const bankName = text(req.body?.bankName);
+      const providerName = text(req.body?.providerName);
+
+      if (method === "BANK") {
+        if (!bankName) {
+          return res.status(400).json({
+            success: false,
+            message: "Bank name is required.",
+          });
+        }
+        if (!accountNumber) accountNumber = text(previous.accountNumber);
+        if (accountNumber.length < 4) {
+          return res.status(400).json({
+            success: false,
+            message: "A valid bank account number is required.",
+          });
+        }
+        phoneNumber = text(previous.phoneNumber);
+      } else {
+        if (!providerName) {
+          return res.status(400).json({
+            success: false,
+            message: "Mobile-money provider name is required.",
+          });
+        }
+        if (!phoneNumber) phoneNumber = text(previous.phoneNumber);
+        if (phoneNumber.length < 7) {
+          return res.status(400).json({
+            success: false,
+            message: "A valid mobile-money number is required.",
+          });
+        }
+        accountNumber = text(previous.accountNumber);
+      }
+
+      await ref.set(
+        {
+          managerUid: manager.uid,
+          country,
+          currency,
+          method,
+          accountName,
+          bankName,
+          branchCode: text(req.body?.branchCode),
+          sortCode: text(req.body?.sortCode),
+          providerName,
+          accountNumber,
+          phoneNumber,
+          status: "PENDING",
+          rejectionReason: null,
+          verifiedAt: null,
+          verifiedByUid: null,
+          verifiedByEmail: null,
+          createdAt: previous.createdAt ?? FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Payout account saved and submitted for verification.",
+        account: {
+          managerUid: manager.uid,
+          country,
+          currency,
+          method,
+          accountName,
+          bankName,
+          branchCode: text(req.body?.branchCode),
+          sortCode: text(req.body?.sortCode),
+          providerName,
+          maskedAccountNumber:
+            method === "BANK" ? maskPayoutValue(accountNumber) : maskPayoutValue(previous.accountNumber),
+          maskedPhoneNumber:
+            method === "MOBILE_MONEY" ? maskPayoutValue(phoneNumber) : maskPayoutValue(previous.phoneNumber),
+          status: "PENDING",
+        },
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message ?? "Unable to save payout account.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/admin/manager-payroll/:managerUid/payout-account/verify",
+  async (req: Request, res: Response) => {
+    try {
+      const superAdmin = await verifySuperAdmin(req);
+      const managerUid = text(req.params.managerUid);
+      const action = text(req.body?.status).toUpperCase();
+      const reason = text(req.body?.reason);
+
+      if (!managerUid) {
+        return res.status(400).json({
+          success: false,
+          message: "Manager UID is required.",
+        });
+      }
+      if (!["VERIFIED", "REJECTED"].includes(action)) {
+        return res.status(400).json({
+          success: false,
+          message: "Status must be VERIFIED or REJECTED.",
+        });
+      }
+      if (action === "REJECTED" && !reason) {
+        return res.status(400).json({
+          success: false,
+          message: "A rejection reason is required.",
+        });
+      }
+
+      const ref = db.collection("manager_payout_accounts").doc(managerUid);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Manager payout account was not found.",
+        });
+      }
+
+      await ref.set(
+        {
+          status: action,
+          rejectionReason: action === "REJECTED" ? reason : null,
+          verifiedAt: action === "VERIFIED" ? FieldValue.serverTimestamp() : null,
+          verifiedByUid: superAdmin.uid,
+          verifiedByEmail: superAdmin.email,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        managerUid,
+        status: action,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message ?? "Unable to verify payout account.",
+      });
+    }
+  },
+);
+// ============================================================
+// SUPER ADMIN - MANAGER PAYOUT ACCOUNT REVIEW
+// ============================================================
+
+app.get(
+  "/admin/manager-payroll/payout-accounts",
+  async (req: Request, res: Response) => {
+    try {
+      await verifySuperAdmin(req);
+
+      const accountSnap = await db
+        .collection("manager_payout_accounts")
+        .orderBy("updatedAt", "desc")
+        .get();
+
+      const accounts = await Promise.all(
+        accountSnap.docs.map(async (doc) => {
+          const data = doc.data();
+          const managerUid =
+            text(data.managerUid) || doc.id;
+
+          const managerSnap = await db
+            .collection("users")
+            .doc(managerUid)
+            .get();
+
+          const managerData =
+            managerSnap.data() ?? {};
+
+          return {
+            managerUid,
+            managerName: text(
+              managerData.name ??
+                managerData.fullName ??
+                data.managerName,
+            ),
+            managerEmail: text(
+              managerData.email ??
+                data.managerEmail,
+            ),
+            country: normalizeCountry(
+              data.country ??
+                managerData.country,
+            ),
+            currency: normalizeCurrency(
+              data.currency ??
+                managerData.currency,
+            ),
+            method: text(data.method).toUpperCase(),
+            accountName: text(data.accountName),
+            bankName: text(data.bankName),
+            branchCode: text(data.branchCode),
+            sortCode: text(data.sortCode),
+            providerName: text(data.providerName),
+            maskedAccountNumber: maskPayoutValue(
+              data.accountNumber,
+            ),
+            maskedPhoneNumber: maskPayoutValue(
+              data.phoneNumber,
+            ),
+            status:
+              text(data.status) || "PENDING",
+            rejectionReason:
+              text(data.rejectionReason) || null,
+            verifiedAt:
+              data.verifiedAt ?? null,
+            updatedAt:
+              data.updatedAt ?? null,
+          };
+        }),
+      );
+
+      return res.status(200).json({
+        success: true,
+        accounts,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to load Manager payout accounts.",
+      });
+    }
+  },
+);
+
+
+// ============================================================
+// SUPER ADMIN - MANAGER PAYROLL CONTROL LIST
+// ============================================================
+
+app.get(
+  "/admin/manager-payroll",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      const payrollSnap = await db
+        .collection("manager_payroll")
+        .get();
+
+      const rows = await Promise.all(
+        payrollSnap.docs.map(async (doc) => {
+          const data = doc.data();
+          const payrollId = text(data.payrollId ?? doc.id);
+          const managerUid = text(data.managerUid);
+
+          let managerData: DocumentData = {};
+          if (managerUid) {
+            const managerSnap = await db
+              .collection("users")
+              .doc(managerUid)
+              .get();
+            managerData = managerSnap.data() ?? {};
+          }
+
+          let payoutAccount: DocumentData = {};
+          if (managerUid) {
+            const payoutSnap = await db
+              .collection("manager_payout_accounts")
+              .doc(managerUid)
+              .get();
+            payoutAccount = payoutSnap.data() ?? {};
+          }
+
+          const amount = payrollPayoutAmount(data);
+          // ==========================================================
+  const payoutMethod = text(
+            data.payoutMethod ?? payoutAccount.method,
+          ).toLowerCase();
+          const rawValue = payoutMethod.includes("bank")
+              ? text(payoutAccount.accountNumber)
+              : text(payoutAccount.phoneNumber);
+
+          return {
+            payrollId,
+            managerUid,
+            managerName: text(
+              data.managerName ??
+                managerData.name ??
+                managerData.fullName ??
+                managerData.email,
+            ),
+            managerEmail: text(
+              data.managerEmail ?? managerData.email,
+            ),
+            country: normalizeCountry(
+              data.country ??
+                payoutAccount.country ??
+                managerData.country,
+            ),
+            currency: normalizeCurrency(
+              data.currency ??
+                payoutAccount.currency ??
+                managerData.currency ??
+                "MWK",
+            ),
+            amount,
+            displayAmount: `${normalizeCurrency(data.currency ?? payoutAccount.currency ?? managerData.currency ?? "MWK")} ${amount.toFixed(2)}`,
+            status: text(data.status),
+            approvedForPayment: data.approvedForPayment === true,
+            payoutStatus: text(data.payoutStatus),
+            payoutMethod,
+            payoutAccountStatus: text(payoutAccount.status).toUpperCase(),
+            maskedPayoutValue: maskPayoutValue(rawValue),
+            providerName: text(
+              payoutAccount.providerName ?? payoutAccount.bankName,
+            ),
+            updatedAt: data.updatedAt ?? null,
+          };
+        }),
+      );
+
+      return res.status(200).json({
+        success: true,
+        payrolls: rows,
+      });
+    } catch (error: any) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message ?? "Unable to load Manager payroll.",
+      });
+    }
+  },
+);
+
+// ============================================================
+// SUPER ADMIN - REAL MANAGER PAYROLL PAYOUT VERIFICATION
+// ============================================================
+
+app.get(
+  "/admin/manager-payroll/:payrollId/payout/verify",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      assertPayChanguConfigured();
+
+      const payrollId = text(req.params.payrollId);
+
+      if (!payrollId) {
+        return res.status(400).json({
+          success: false,
+          error: "Payroll ID is required.",
+        });
+      }
+
+      const payrollRef = db
+        .collection("manager_payroll")
+        .doc(payrollId);
+
+      const payrollSnap = await payrollRef.get();
+
+      if (!payrollSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Manager payroll record not found.",
+        });
+      }
+
+      const payroll = payrollSnap.data() ?? {};
+
+      const payoutId = text(payroll.payoutId);
+      const payoutChargeId = text(
+        payroll.payoutChargeId ??
+          payroll.chargeId,
+      );
+
+      if (!payoutId && !payoutChargeId) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "This payroll does not have a payout transaction yet.",
+        });
+      }
+
+      let payoutSnap:
+        | FirebaseFirestore.DocumentSnapshot<DocumentData>
+        | null = null;
+
+      if (payoutId) {
+        const snap = await db
+          .collection("manager_payroll_payouts")
+          .doc(payoutId)
+          .get();
+
+        if (snap.exists) {
+          payoutSnap = snap;
+        }
+      }
+
+      if (!payoutSnap && payoutChargeId) {
+        const query = await db
+          .collection("manager_payroll_payouts")
+          .where("providerChargeId", "==", payoutChargeId)
+          .limit(1)
+          .get();
+
+        if (!query.empty) {
+          payoutSnap = query.docs[0];
+        }
+      }
+
+      if (!payoutSnap && payoutChargeId) {
+        const query = await db
+          .collection("manager_payroll_payouts")
+          .where("chargeId", "==", payoutChargeId)
+          .limit(1)
+          .get();
+
+        if (!query.empty) {
+          payoutSnap = query.docs[0];
+        }
+      }
+
+      if (!payoutSnap) {
+        return res.status(404).json({
+          success: false,
+          error:
+            "Manager payout transaction record not found.",
+        });
+      }
+
+      const payout = payoutSnap.data() ?? {};
+
+      const chargeId = text(
+        payout.providerChargeId ??
+          payout.chargeId ??
+          payoutChargeId,
+      );
+
+      if (!chargeId) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "Provider charge ID is missing from the payout.",
+        });
+      }
+
+      const providerResult = await payChanguRequest(
+        `/direct-charge/payouts/${encodeURIComponent(chargeId)}/details`,
+        {
+          method: "GET",
+        },
+      );
+
+      if (!providerResult.response.ok) {
+        return res.status(502).json({
+          success: false,
+          error:
+            `PayChangu payout verification failed with HTTP ${providerResult.response.status}: ` +
+            safeJson(providerResult.data),
+        });
+      }
+
+      const providerData =
+        providerResult.data?.data?.transaction ??
+        providerResult.data?.transaction ??
+        providerResult.data?.data ??
+        providerResult.data ??
+        {};
+
+      const providerStatusValue =
+        text(providerData.status) ||
+        text(providerResult.data?.status) ||
+        "pending";
+
+      const expectedAmount = money(
+        payout.amount ??
+          payrollPayoutAmount(payroll),
+      );
+
+      const providerAmount = money(
+        providerData.amount,
+      );
+
+      const expectedCurrency = normalizeCurrency(
+        payout.currency ??
+          payroll.currency ??
+          "MWK",
+      );
+
+      const providerCurrency = normalizeCurrency(
+        providerData.currency ??
+          expectedCurrency,
+      );
+
+      if (
+        providerAmount > 0 &&
+        Math.abs(
+          providerAmount - expectedAmount,
+        ) > 0.0001
+      ) {
+        await payoutSnap.ref.set(
+          {
+            status: "FAILED",
+            providerStatus:
+              providerStatusValue,
+            verificationError:
+              "Provider amount does not match payroll payout amount.",
+            providerVerificationResponse:
+              providerResult.data,
+            providerVerifiedAt:
+              FieldValue.serverTimestamp(),
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        await payrollRef.set(
+          {
+            payoutStatus: "FAILED",
+            payoutProviderStatus:
+              providerStatusValue,
+            payoutVerificationError:
+              "Provider amount does not match payroll payout amount.",
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(409).json({
+          success: false,
+          verified: false,
+          payoutStatus: "FAILED",
+          error:
+            "Provider amount does not match payroll payout amount.",
+        });
+      }
+
+      if (
+        providerCurrency &&
+        expectedCurrency !== providerCurrency
+      ) {
+        await payoutSnap.ref.set(
+          {
+            status: "FAILED",
+            providerStatus:
+              providerStatusValue,
+            verificationError:
+              "Provider currency does not match payroll currency.",
+            providerVerificationResponse:
+              providerResult.data,
+            providerVerifiedAt:
+              FieldValue.serverTimestamp(),
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        await payrollRef.set(
+          {
+            payoutStatus: "FAILED",
+            payoutProviderStatus:
+              providerStatusValue,
+            payoutVerificationError:
+              "Provider currency does not match payroll currency.",
+            updatedAt:
+              FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+
+        return res.status(409).json({
+          success: false,
+          verified: false,
+          payoutStatus: "FAILED",
+          error:
+            "Provider currency does not match payroll currency.",
+        });
+      }
+
+      const providerSucceeded = isSuccess(
+        providerStatusValue,
+      );
+
+      const providerFailed = isFailed(
+        providerStatusValue,
+      );
+
+      const nextStatus = providerSucceeded
+        ? "PAID"
+        : providerFailed
+          ? "FAILED"
+          : "PROCESSING";
+
+      await payoutSnap.ref.set(
+        {
+          status: nextStatus,
+          providerStatus:
+            providerStatusValue,
+          providerVerificationResponse:
+            providerResult.data,
+          providerVerifiedAt:
+            FieldValue.serverTimestamp(),
+          ...(providerSucceeded
+            ? {
+                paidAt:
+                  FieldValue.serverTimestamp(),
+              }
+            : {}),
+          ...(providerFailed
+            ? {
+                failureReason:
+                  text(providerData.message) ||
+                  text(providerResult.data?.message) ||
+                  "Provider reported payout failure.",
+              }
+            : {}),
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      await payrollRef.set(
+        {
+          payoutStatus: nextStatus,
+          payoutProviderStatus:
+            providerStatusValue,
+          payoutVerifiedAt:
+            FieldValue.serverTimestamp(),
+          ...(providerSucceeded
+            ? {
+                status: "Paid",
+                paidAt:
+                  FieldValue.serverTimestamp(),
+              }
+            : {}),
+          ...(providerFailed
+            ? {
+                payoutFailureReason:
+                  text(providerData.message) ||
+                  text(providerResult.data?.message) ||
+                  "Provider reported payout failure.",
+              }
+            : {}),
+          updatedAt:
+            FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        verified: providerSucceeded,
+        payrollId,
+        payoutId: payoutSnap.id,
+        chargeId,
+        payoutStatus: nextStatus,
+        providerStatus:
+          providerStatusValue,
+        amount: expectedAmount,
+        currency: expectedCurrency,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// SUPER ADMIN - MANAGER PAYROLL PAYOUT BALANCE
+// ============================================================
+
+app.get(
+  "/admin/manager-payroll/payout-balance",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      assertPayChanguConfigured();
+
+      const currency = normalizeCurrency(
+        text(req.query.currency) || "MWK",
+      );
+
+      const balance =
+        await getPayChanguWalletBalance(currency);
+
+      return res.status(200).json({
+        success: true,
+        currency: balance.currency || currency,
+        environment: balance.environment,
+        mainBalance: balance.mainBalance,
+        collectionBalance:
+          balance.collectionBalance,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      });
+    }
+  },
+);
+
+// ============================================================
+// SUPER ADMIN - REAL MONEY MANAGER PAYROLL READINESS
+// ============================================================
+// Read-only endpoint. It NEVER creates a payout or moves money.
+// ============================================================
+// ============================================================
+// SUPER ADMIN - REAL MONEY MANAGER PAYROLL READINESS
+// ============================================================
+// Read-only endpoint. It NEVER creates a payout or moves money.
+// ============================================================
+// ============================================================
+// SUPER ADMIN - REAL MONEY MANAGER PAYROLL READINESS
+// ============================================================
+// Read-only endpoint. It NEVER creates a payout or moves money.
+// ============================================================
+// ============================================================
+// SUPER ADMIN - REAL MONEY MANAGER PAYROLL READINESS
+// ============================================================
+// Read-only endpoint. It NEVER creates a payout or moves money.
+// ============================================================
+app.get(
+  "/admin/manager-payroll/real-money-readiness",
+  async (req: Request, res: Response) => {
+    try {
+      const admin = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      const secretConfigured = !!text(
+        process.env.PAYCHANGU_SECRET_KEY,
+      );
+      const webhookConfigured = !!text(
+        process.env.PAYCHANGU_WEBHOOK_SECRET,
+      );
+      const paymentMode =
+        text(process.env.PAYMENT_MODE) ||
+        text(process.env.PAYCHANGU_MODE) ||
+        "unknown";
+      const liveOnly =
+        paymentMode.toLowerCase() === "live-only" ||
+        paymentMode.toLowerCase() === "live";
+
+      let wallet = null;
+      let walletCheckError = "";
+
+      if (secretConfigured && liveOnly) {
+        try {
+          const currency = normalizeCurrency(
+            text(req.query.currency) || "MWK",
+          );
+          const result = await getPayChanguWalletBalance(currency);
+          wallet = {
+            environment: result.environment,
+            currency: result.currency || currency,
+            mainBalance: result.mainBalance,
+            collectionBalance: result.collectionBalance,
+          };
+        } catch (walletError) {
+          walletCheckError =
+            walletError instanceof Error
+              ? walletError.message
+              : String(walletError);
+        }
+      }
+
+      return res.status(200).json({
+        success: true,
+        requestedBy: admin.uid,
+        liveMoneyReady:
+          secretConfigured && liveOnly && !walletCheckError,
+        secretConfigured,
+        webhookConfigured,
+        paymentMode,
+        wallet,
+        walletCheckError: walletCheckError || null,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+      const lowerMessage = message.toLowerCase();
+
+      const statusCode =
+        lowerMessage.includes("authorization token is required") ||
+        lowerMessage.includes("authorization token is empty") ||
+        lowerMessage.includes("invalid token") ||
+        lowerMessage.includes("invalid signature") ||
+        lowerMessage.includes("token has expired")
+          ? 401
+          : (
+              lowerMessage.includes("not authorized") ||
+              lowerMessage.includes("only super admin") ||
+              lowerMessage.includes("account is not active") ||
+              lowerMessage.includes("profile was not found")
+            )
+              ? 403
+              : 500;
+
+      return res.status(statusCode).json({
+        success: false,
+        error: message,
+      });
+    }
+  },
+);
+
+// ROOT / HEALTH / API
+// ============================================================
+
+app.get(
+  "/",
+  (_req, res) => {
+    res.status(200).json({
+      success: true,
+
+      service:
+        "MobiFlex African Backend",
+
+      status:
+        "running",
+
+      paymentProvider:
+        "PayChangu",
+
+      paymentMode:
+        PAYCHANGU_LIVE_ONLY
+          ? "live-only"
+          : "configured",
+
+      applicationPendingTimeoutMinutes:
+        APPLICATION_PENDING_TIMEOUT_MINUTES,
+
+      defaultGracePeriodDays:
+        DEFAULT_GRACE_PERIOD_DAYS,
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  },
+);
+
+app.get(
+  "/health",
+  (_req, res) => {
+    res.status(200).json({
+      success: true,
+
+      service:
+        "mobiflex-african-backend",
+
+      status:
+        "healthy",
+
+      paymentProvider:
+        "PayChangu",
+
+      payChanguSecretConfigured:
+        Boolean(
+          PAYCHANGU_SECRET_KEY,
+        ),
+
+      webhookConfigured:
+        Boolean(
+          PAYCHANGU_WEBHOOK_SECRET,
+        ),
+
+      airtelOperatorConfigured:
+        Boolean(
+          PAYCHANGU_AIRTEL_OPERATOR_REF_ID,
+        ),
+
+      tnmOperatorConfigured:
+        Boolean(
+          PAYCHANGU_TNM_OPERATOR_REF_ID,
+        ),
+
+      applicationPendingTimeoutMinutes:
+        APPLICATION_PENDING_TIMEOUT_MINUTES,
+
+      defaultGracePeriodDays:
+        DEFAULT_GRACE_PERIOD_DAYS,
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  },
+);
+// ============================================================
+// CUSTOMER SERVICE ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â CUSTOMER LOOKUP
+// ============================================================
+
+app.post(
+  "/customer-service/customer/lookup",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const searchType = normalizeRole(
+        req.body?.searchType ?? "",
+      );
+
+      const value = text(req.body?.value).trim();
+
+      const country = text(
+        req.body?.country ??
+          req.body?.countryCode ??
+          "",
+      )
+        .trim()
+        .toUpperCase();
+
+      if (!value) {
+        return res.status(400).json({
+          success: false,
+          message: "Search value is required.",
+        });
+      }
+
+      if (
+        ![
+          "referral number",
+          "referral",
+          "phone number",
+          "phone",
+          "application reference",
+          "application ref",
+          "application",
+        ].includes(searchType)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Search type must be Referral Number, Phone Number or Application Reference.",
+        });
+      }
+
+      let customerData: DocumentData | null = null;
+      let customerId = "";
+      let applicationId = "";
+
+      // --------------------------------------------------------
+      // 1. PHONE SEARCH
+      // --------------------------------------------------------
+
+      if (
+        searchType === "phone number" ||
+        searchType === "phone"
+      ) {
+        let normalizedPhone = value;
+
+        if (country) {
+          normalizedPhone = normalizeInternationalPhone(
+            value,
+            country,
+          );
+        }
+
+        const phoneSnap = await db
+          .collection("customers")
+          .where("phone", "==", normalizedPhone)
+          .limit(1)
+          .get();
+
+        if (!phoneSnap.empty) {
+          const doc = phoneSnap.docs[0];
+          customerId = doc.id;
+          customerData = doc.data();
+        } else {
+          // Fallback for older records where phone may not
+          // already be stored in E.164 format.
+          const allCustomers = await db
+            .collection("customers")
+            .limit(1000)
+            .get();
+
+          for (const doc of allCustomers.docs) {
+            const data = doc.data();
+            const storedPhone = text(
+              data.phone ?? data.customerPhone,
+            );
+
+            if (!storedPhone) continue;
+
+            try {
+              const normalizedStoredPhone =
+                country
+                  ? normalizeInternationalPhone(
+                      storedPhone,
+                      country,
+                    )
+                  : storedPhone;
+
+              if (
+                normalizedStoredPhone ===
+                normalizedPhone
+              ) {
+                customerId = doc.id;
+                customerData = data;
+                break;
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      // --------------------------------------------------------
+      // 2. REFERRAL NUMBER SEARCH
+      // --------------------------------------------------------
+
+      if (
+        !customerData &&
+        [
+          "referral number",
+          "referral",
+        ].includes(searchType)
+      ) {
+        const referralFields = [
+          "referralNumber",
+          "customerReferralNumber",
+          "referral",
+        ];
+
+        for (const field of referralFields) {
+          const snap = await db
+            .collection("customers")
+            .where(field, "==", value)
+            .limit(1)
+            .get();
+
+          if (!snap.empty) {
+            const doc = snap.docs[0];
+            customerId = doc.id;
+            customerData = doc.data();
+            break;
+          }
+        }
+      }
+
+      // --------------------------------------------------------
+      // 3. APPLICATION REFERENCE SEARCH
+      // --------------------------------------------------------
+
+      if (
+        !customerData &&
+        [
+          "application reference",
+          "application ref",
+          "application",
+        ].includes(searchType)
+      ) {
+        const directApplication = await db
+          .collection("applications")
+          .doc(value)
+          .get();
+
+        if (directApplication.exists) {
+          const data =
+            directApplication.data() ?? {};
+
+          applicationId = directApplication.id;
+
+          customerId = text(
+            data.customerId ??
+              data.customerUid ??
+              data.userId,
+          );
+        } else {
+          const applicationFields = [
+            "applicationReference",
+            "applicationRef",
+            "referenceNumber",
+            "referralNumber",
+          ];
+
+          for (const field of applicationFields) {
+            const snap = await db
+              .collection("applications")
+              .where(field, "==", value)
+              .limit(1)
+              .get();
+
+            if (!snap.empty) {
+              const doc = snap.docs[0];
+              const data = doc.data();
+
+              applicationId = doc.id;
+
+              customerId = text(
+                data.customerId ??
+                  data.customerUid ??
+                  data.userId,
+              );
+
+              break;
+            }
+          }
+        }
+
+        if (customerId) {
+          const customerSnap = await db
+            .collection("customers")
+            .doc(customerId)
+            .get();
+
+          if (customerSnap.exists) {
+            customerData =
+              customerSnap.data() ?? {};
+          }
+        }
+      }
+
+      if (!customerData || !customerId) {
+        return res.status(404).json({
+          success: false,
+          found: false,
+          message:
+            "No matching MobiFlex customer was found.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // CUSTOMER STATUS CHECK
+      // --------------------------------------------------------
+
+      const status = text(
+        customerData.status ??
+          customerData.accountStatus ??
+          "active",
+      )
+        .trim()
+        .toLowerCase();
+
+      if (
+        [
+          "disabled",
+          "blocked",
+          "inactive",
+          "suspended",
+          "rejected",
+        ].includes(status)
+      ) {
+        return res.status(403).json({
+          success: false,
+          found: true,
+          message:
+            "This customer account is not active.",
+        });
+      }
+
+      // --------------------------------------------------------
+      // LIMITED LOOKUP RESPONSE ONLY
+      //
+      // Do NOT return:
+      // - payment history
+      // - balance
+      // - IMEI
+      // - device lock state
+      // - financing details
+      // - KYC documents
+      // - passwords
+      // - payment provider data
+      //
+      // Those require successful verification.
+      // --------------------------------------------------------
+
+      const name = text(
+        customerData.name ??
+          customerData.fullName ??
+          customerData.customerName,
+      );
+
+      const phone = text(
+        customerData.phone ??
+          customerData.customerPhone,
+      );
+
+      const customerCountry = normalizeCountry(
+        customerData.country ??
+          customerData.countryCode ??
+          "MW",
+      );
+
+      const referralNumber = text(
+        customerData.referralNumber ??
+          customerData.customerReferralNumber ??
+          customerData.referral,
+      );
+
+      return res.status(200).json({
+        success: true,
+        found: true,
+        verified: false,
+        verificationRequired: true,
+
+        customer: {
+          id: customerId,
+          name,
+          phone,
+          country: customerCountry,
+          referralNumber:
+            referralNumber || null,
+        },
+
+        applicationReference:
+          applicationId || null,
+
+        protectedDataAvailable: false,
+
+        message:
+          "Customer found. Verification is required before protected customer information can be viewed.",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service customer lookup error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to perform customer lookup.",
+      });
+    }
+  },
+);
+ // ============================================================
+// CUSTOMER SERVICE ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â SUPPORT INBOX
+// ============================================================
+
+app.get(
+  "/customer-service/support/conversations",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const requestedStatus = normalizeRole(
+        req.query?.status ?? "",
+      );
+
+      const allowedStatuses = [
+        "new",
+        "open",
+        "waiting",
+        "resolved",
+      ];
+
+      const limitValue = Number(
+        req.query?.limit ?? 50,
+      );
+
+      const limit = Math.min(
+        Math.max(
+          Number.isFinite(limitValue)
+            ? Math.trunc(limitValue)
+            : 50,
+          1,
+        ),
+        100,
+      );
+
+      let query:
+          FirebaseFirestore.Query<DocumentData> =
+        db
+          .collection("support_conversations")
+          .limit(100);
+
+      if (
+        requestedStatus &&
+        allowedStatuses.includes(requestedStatus)
+      ) {
+        query = db
+          .collection("support_conversations")
+          .where(
+            "status",
+            "==",
+            requestedStatus,
+          )
+          .limit(100);
+      }
+
+      const snapshot = await query.get();
+
+      const conversations: Array<
+  DocumentData & { id: string }
+> = snapshot.docs
+  .map((doc) => {
+    const data = doc.data() as DocumentData;
+
+    return {
+      id: doc.id,
+      ...data,
+    } as DocumentData & { id: string };
+  })
+  .sort((a, b) => {
+          const aTime =
+            a.lastMessageAt?.toMillis?.() ??
+            a.updatedAt?.toMillis?.() ??
+            a.createdAt?.toMillis?.() ??
+            0;
+
+          const bTime =
+            b.lastMessageAt?.toMillis?.() ??
+            b.updatedAt?.toMillis?.() ??
+            b.createdAt?.toMillis?.() ??
+            0;
+
+          return bTime - aTime;
+        })
+        .slice(0, limit);
+
+      return res.status(200).json({
+        success: true,
+        staffUid: staff.uid,
+        conversations,
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service support conversations error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to load Support Inbox.",
+      });
+    }
+  },
+);
+
+app.get(
+  "/customer-service/support/conversations/:conversationId/messages",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const conversationId = text(
+        req.params.conversationId,
+      );
+
+      if (!conversationId) {
+        return res.status(400).json({
+          success: false,
+          message: "Conversation ID is required.",
+        });
+      }
+
+      const conversationRef = db
+        .collection("support_conversations")
+        .doc(conversationId);
+
+      const conversationSnap =
+        await conversationRef.get();
+
+      if (!conversationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found.",
+        });
+      }
+
+      const messageSnapshot =
+        await conversationRef
+          .collection("messages")
+          .limit(200)
+          .get();
+const messages: Array<
+  DocumentData & { id: string }
+> = messageSnapshot.docs
+  .map((doc) => {
+    const data = doc.data() as DocumentData;
+
+    return {
+      id: doc.id,
+      ...data,
+    } as DocumentData & { id: string };
+  })
+  .sort((a, b) => {
+          const aTime =
+            a.createdAt?.toMillis?.() ?? 0;
+
+          const bTime =
+            b.createdAt?.toMillis?.() ?? 0;
+
+          return aTime - bTime;
+        });
+
+      return res.status(200).json({
+        success: true,
+        conversation: {
+          id: conversationSnap.id,
+          ...(conversationSnap.data() ?? {}),
+        },
+        messages,
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service support messages error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to load support messages.",
+      });
+    }
+  },
+);
+
+app.post(
+  "/customer-service/support/conversations/:conversationId/reply",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const conversationId = text(
+        req.params.conversationId,
+      );
+
+      const message = text(
+        req.body?.message,
+      ).trim();
+
+      if (!conversationId) {
+        return res.status(400).json({
+          success: false,
+          message: "Conversation ID is required.",
+        });
+      }
+
+      if (!message) {
+        return res.status(400).json({
+          success: false,
+          message: "Message is required.",
+        });
+      }
+
+      if (message.length > 5000) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Message must not exceed 5000 characters.",
+        });
+      }
+
+      const conversationRef = db
+        .collection("support_conversations")
+        .doc(conversationId);
+
+      const conversationSnap =
+        await conversationRef.get();
+
+      if (!conversationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found.",
+        });
+      }
+
+      const messageRef =
+        conversationRef
+          .collection("messages")
+          .doc();
+
+      const batch = db.batch();
+
+      batch.set(messageRef, {
+        conversationId,
+        senderType: "staff",
+        senderUid: staff.uid,
+        senderEmail: staff.email,
+        message,
+        createdAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      batch.update(conversationRef, {
+        lastMessage: message,
+        lastMessageSenderType: "staff",
+        lastMessageSenderUid: staff.uid,
+        lastMessageAt:
+          FieldValue.serverTimestamp(),
+        status: "open",
+        assignedStaffUid: staff.uid,
+        assignedStaffEmail: staff.email,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
+
+      return res.status(201).json({
+        success: true,
+        messageId: messageRef.id,
+        status: "open",
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service support reply error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to send support reply.",
+      });
+    }
+  },
+);
+
+app.patch(
+  "/customer-service/support/conversations/:conversationId/status",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const conversationId = text(
+        req.params.conversationId,
+      );
+
+      const status = normalizeRole(
+        req.body?.status ?? "",
+      );
+
+      const allowedStatuses = [
+        "new",
+        "open",
+        "waiting",
+        "resolved",
+      ];
+
+      if (!conversationId) {
+        return res.status(400).json({
+          success: false,
+          message: "Conversation ID is required.",
+        });
+      }
+
+      if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Status must be new, open, waiting or resolved.",
+        });
+      }
+
+      const conversationRef = db
+        .collection("support_conversations")
+        .doc(conversationId);
+
+      const conversationSnap =
+        await conversationRef.get();
+
+      if (!conversationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found.",
+        });
+      }
+
+      await conversationRef.update({
+        status,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+        lastStatusChangedByUid:
+          staff.uid,
+        lastStatusChangedByEmail:
+          staff.email,
+      });
+
+      return res.status(200).json({
+        success: true,
+        conversationId,
+        status,
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service support status error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to update support conversation status.",
+      });
+    }
+  },
+);
+
+app.patch(
+  "/customer-service/support/conversations/:conversationId/assign",
+  async (req: Request, res: Response) => {
+    try {
+      const staff = await verifyStaff(req, [
+        "customer service",
+        "customer service staff",
+        "customer support",
+        "support",
+      ]);
+
+      const conversationId = text(
+        req.params.conversationId,
+      );
+
+      if (!conversationId) {
+        return res.status(400).json({
+          success: false,
+          message: "Conversation ID is required.",
+        });
+      }
+
+      const conversationRef = db
+        .collection("support_conversations")
+        .doc(conversationId);
+
+      const conversationSnap =
+        await conversationRef.get();
+
+      if (!conversationSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found.",
+        });
+      }
+
+      await conversationRef.update({
+        assignedStaffUid: staff.uid,
+        assignedStaffEmail: staff.email,
+        updatedAt:
+          FieldValue.serverTimestamp(),
+      });
+
+      return res.status(200).json({
+        success: true,
+        conversationId,
+        assignedStaffUid: staff.uid,
+        assignedStaffEmail: staff.email,
+      });
+    } catch (error: any) {
+      console.error(
+        "Customer Service support assignment error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message ??
+          "Unable to assign support conversation.",
+      });
+    }
+  },
+);
+app.get(
+  "/api",
+  (_req, res) => {
+    res.status(200).json({
+      success: true,
+
+      service:
+        "MobiFlex African Backend",
+
+      version:
+        "3.0.0-real-money-workflow",
+
+      routes: {
+        customerLogin:
+          "POST /customer/login",
+
+        customerRegisterStart:
+          "POST /customer/register/start",
+
+        customerRegisterSendOtp:
+          "POST /customer/register/send-otp",
+
+        customerRegisterVerifyOtp:
+          "POST /customer/register/verify-otp",
+
+        customerMobileMoney:
+          "POST /payments/real/customer/mobile-money",
+
+        customerVerify:
+          "GET /payments/real/customer/verify/:paymentId",
+        customerPaymentHistory:
+          "GET /payments/real/customer/history",
+
+        staffMobileMoney:
+          "POST /payments/real/mobile-money",
+
+        staffVerify:
+          "GET /payments/real/verify/:chargeId",
+
+        checkout:
+          "POST /payments/real/checkout",
+
+        operators:
+          "GET /payments/real/operators",
+
+        capabilities:
+          "GET /payments/real/capabilities",
+
+        webhook:
+          "POST /webhooks/paychangu",
+
+        settlementRequest:
+          "POST /settlements/bank/request",
+
+        settlementApprove:
+          "POST /settlements/bank/:settlementId/approve",
+
+        banks:
+          "GET /settlements/banks",
+
+        customerCreate:
+          "POST /admin/customers/create",
+
+        accountCreate:
+          "POST /admin/accounts/create",
+
+        managerCreate:
+          "POST /admin/managers/create",
+
+        kycReject:
+          "POST /admin/kyc/reject",
+
+        androidEnrollment:
+          "POST /admin/android-agent/enrollment",
+
+        androidAuthentication:
+          "POST /authenticateAndroidAgent",
+
+        applicationCreate:
+          "POST /applications/create",
+
+        applicationWorkflow:
+          "GET /applications/:applicationId/workflow",
+
+        applicationApprove:
+          "POST /applications/:applicationId/approve",
+
+        applicationReject:
+          "POST /applications/:applicationId/reject",
+
+        applicationImei:
+          "POST /applications/:applicationId/imei",
+
+        applicationCustomerVerification:
+          "POST /applications/:applicationId/customer-verification",
+
+        applicationDeviceSetup:
+          "POST /applications/:applicationId/device/setup/start",
+
+        applicationDeviceReady:
+          "POST /applications/:applicationId/device/ready",
+
+        applicationAgreement:
+          "POST /applications/:applicationId/agreement",
+
+        applicationDepositPrepare:
+          "POST /applications/:applicationId/deposit/prepare",
+      },
+
+      timestamp:
+        new Date().toISOString(),
+    });
+  },
+);
+
+// ============================================================
+// 404 / ERROR
+// ============================================================
+
+app.use(
+  (
+    req: Request,
+    res: Response,
+  ) => {
+    res.status(404).json({
+      success: false,
+
+      message:
+        `Route not found: ${req.method} ${req.originalUrl}`,
+    });
+  },
+);
+
+// ============================================================
+// MANAGER PAYROLL - OWN RECORDS ONLY
+// ============================================================
+
+app.get(
+  "/manager/payroll/me",
+  async (req: Request, res: Response) => {
+    try {
+      const manager = await verifyStaff(req, ["manager"]);
+
+      const snapshot = await db
+        .collection("manager_payroll")
+        .where("managerUid", "==", manager.uid)
+        .limit(100)
+        .get();
+
+      const payroll = snapshot.docs
+        .map((doc) => {
+          const data = doc.data();
+          const paymentDate = data.paymentDate ?? data.paidAt ?? data.createdAt ?? null;
+
+          let normalizedPaymentDate: string | null = null;
+          if (paymentDate instanceof Timestamp) {
+            normalizedPaymentDate = paymentDate.toDate().toISOString();
+          } else {
+            const raw = text(paymentDate);
+            normalizedPaymentDate = raw || null;
+          }
+
+          const basicSalary = money(data.basicSalary);
+          const allowances = money(data.allowances);
+          const deductions = money(data.deductions);
+          const netSalary = money(
+            data.netSalary ??
+              basicSalary + allowances - deductions,
+          );
+          const commissionTotal = money(data.commissionTotal);
+          const totalEarnings = money(
+            data.totalEarnings ??
+              netSalary + commissionTotal,
+          );
+
+          return {
+            payrollId: doc.id,
+            managerUid: manager.uid,
+            managerName: text(
+              data.managerName ??
+                manager.userData.name ??
+                manager.userData.fullName ??
+                manager.userData.displayName,
+            ),
+            currency: text(
+              data.currency ??
+                manager.userData.currency ??
+                "MWK",
+            ),
+            periodLabel: text(
+              data.periodLabel ??
+                data.payPeriod ??
+                data.period,
+            ),
+            basicSalary,
+            allowances,
+            deductions,
+            netSalary,
+            commissionTotal,
+            totalEarnings,
+            status: text(data.status ?? "Pending"),
+            paymentDate: normalizedPaymentDate,
+          };
+        })
+        .sort((a, b) =>
+          text(b.paymentDate).localeCompare(text(a.paymentDate)),
+        );
+
+      return res.status(200).json({
+        success: true,
+        managerUid: manager.uid,
+        managerName: text(
+          manager.userData.name ??
+            manager.userData.fullName ??
+            manager.userData.displayName ??
+            manager.email,
+        ),
+        currency: text(
+          payroll[0]?.currency ??
+            manager.userData.currency ??
+            "MWK",
+        ),
+        payroll,
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+// ============================================================
+// MANAGER PAYROLL PAYOUT ENGINE
+// ============================================================
+// Super Admin approves payroll, then MobiFlex sends the actual
+// payout through the configured PayChangu payout API. A payroll
+// record is marked PAID only when the provider reports success.
+// ============================================================
+
+function payrollPayoutStatus(data: any): string {
+  return providerStatus(data).toLowerCase();
+}
+
+function payrollPayoutAmount(data: DocumentData): number {
+  const explicitTotal = money(data.totalEarnings);
+  if (explicitTotal > 0) return explicitTotal;
+  return money(data.netSalary) + money(data.commissionTotal);
+}
+
+
+// ============================================================
+// REAL MONEY - PAYCHANGU WALLET BALANCE
+// ============================================================
+
+async function getPayChanguWalletBalance(currency: string): Promise<{
+  environment: string;
+  currency: string;
+  mainBalance: number;
+  collectionBalance: number;
+  raw: any;
+}> {
+  const normalizedCurrency = normalizeCurrency(currency);
+
+  if (!normalizedCurrency) {
+    throw new Error("Payout currency is required.");
+  }
+
+  const result = await payChanguRequest(
+    `/wallet-balance?currency=${encodeURIComponent(normalizedCurrency)}`,
+    {
+      method: "GET",
+    },
+  );
+
+  if (!result.response.ok) {
+    throw new Error(
+      `PayChangu wallet balance request failed with HTTP ${result.response.status}: ${safeJson(result.data)}`,
+    );
+  }
+
+  const data =
+    result.data?.data &&
+    typeof result.data.data === "object"
+      ? result.data.data
+      : result.data ?? {};
+
+  return {
+    environment: text(data.environment),
+    currency: normalizeCurrency(
+      data.currency ?? normalizedCurrency,
+    ),
+    mainBalance: money(data.main_balance),
+    collectionBalance: money(data.collection_balance),
+    raw: result.data,
+  };
+}
+async function initiateManagerPayrollPayout(input: {
+  payrollId: string;
+  payroll: DocumentData;
+  manager: {
+    uid: string;
+    email: string;
+    userData: DocumentData;
+  };
+  body: Record<string, unknown>;
+}) {
+  assertPayChanguConfigured();
+  // SECURITY GATE: Manager payroll payouts require a Super Admin-verified
+  // payout account. Firestore records are used only after this status gate;
+  // provider response remains authoritative for the final PAID status.
+  const payoutAccountSnap = await db
+    .collection("manager_payout_accounts")
+    .doc(input.manager.uid)
+    .get();
+
+  if (!payoutAccountSnap.exists) {
+    throw new Error(
+      "Manager payout account is not configured. The Manager must add a payout account before payroll payout.",
+    );
+  }
+
+  const payoutAccount = payoutAccountSnap.data() ?? {};
+  const payoutAccountStatus = text(payoutAccount.status).toUpperCase();
+
+  if (payoutAccountStatus !== "VERIFIED") {
+    throw new Error(
+      `Manager payout account must be VERIFIED before payroll payout. Current status: ${payoutAccountStatus || "PENDING"}.`,
+    );
+  }
+
+
+  const payroll = input.payroll;
+  const currency = normalizeCurrency(
+    payroll.currency ??
+      input.manager.userData.currency ??
+      "MWK",
+  );
+
+  if (currency !== "MWK") {
+    throw new Error(
+      "Live payroll payout is currently enabled only for MWK in this MobiFlex PayChangu integration.",
+    );
+  }
+
+  const amount = payrollPayoutAmount(payroll);
+  if (amount <= 0) {
+    throw new Error("Payroll payable amount must be greater than zero.");
+  }
+
+  // ==========================================================
+  // ==========================================================
+  // REAL MONEY BALANCE GATE
+  // ==========================================================
+  // Only PayChangu main/available balance can fund payroll.
+  // Collection balance is not treated as spendable payout cash.
+  // ==========================================================
+  const walletBalance = await getPayChanguWalletBalance(currency);
+
+  if (
+    walletBalance.environment &&
+    walletBalance.environment.toLowerCase() !== "live"
+  ) {
+    throw new Error(
+      `PayChangu wallet is not in live environment. Current environment: ${walletBalance.environment}.`,
+    );
+  }
+
+  if (
+    walletBalance.currency &&
+    walletBalance.currency !== currency
+  ) {
+    throw new Error(
+      `PayChangu wallet currency mismatch. Expected ${currency}, received ${walletBalance.currency}.`,
+    );
+  }
+
+  if (walletBalance.mainBalance + 0.0001 < amount) {
+    throw new Error(
+      `Insufficient PayChangu main balance for payroll payout. Required: ${amount.toFixed(2)} ${currency}; available: ${walletBalance.mainBalance.toFixed(2)} ${currency}.`,
+    );
+  }
+  const payoutMethod = text(
+    input.body.payoutMethod ??
+      input.body.method ??
+      payoutAccount.method,
+  ).toLowerCase();
+
+  if (!payoutMethod) {
+    throw new Error(
+      "Payout method is required: mobile_money or bank_transfer.",
+    );
+  }
+
+  const chargeId = createTransactionId("MFPAY");
+  const payoutRef = db
+    .collection("manager_payroll_payouts")
+    .doc();
+
+  await payoutRef.set({
+    payoutId: payoutRef.id,
+    payrollId: input.payrollId,
+    managerUid: input.manager.uid,
+    managerName: text(
+      payroll.managerName ??
+        input.manager.userData.name ??
+        input.manager.userData.fullName ??
+        input.manager.email,
+    ),
+    currency,
+    amount,
+    payoutMethod,
+    chargeId,
+    status: "PROCESSING",
+    requestedBy: input.manager.uid,
+    requestedByEmail: input.manager.email,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
+  try {
+    let providerResult: any;
+
+    if (
+      payoutMethod === "mobile_money" ||
+      payoutMethod === "mobilemoney" ||
+      payoutMethod === "momo"
+    ) {
+      const operator = normalizeOperator(input.body.operator ?? payoutAccount.providerName);
+      if (!operator) {
+        throw new Error(
+          "Airtel or TNM operator is required for mobile-money payout.",
+        );
+      }
+
+      const operatorInfo = await resolvePayChanguOperator(operator);
+      const mobile = cleanMalawiMobile(input.body.mobile ?? input.body.phone ?? payoutAccount.phoneNumber);
+      if (!/^\+265[89][0-9]{7,8}$/.test(mobile)) {
+        throw new Error(
+          "A valid Malawi mobile-money number is required for payroll payout.",
+        );
+      }
+
+      providerResult = await payChanguRequest(
+        "/mobile-money/payouts/initialize",
+        {
+          method: "POST",
+          body: {
+            mobile,
+            mobile_money_operator_ref_id: operatorInfo.refId,
+            amount: amount.toFixed(2),
+            charge_id: chargeId,
+            ...(text(input.body.email)
+              ? { email: text(input.body.email) }
+              : {}),
+            first_name: firstName(
+              text(
+                payroll.managerName ??
+                  input.manager.userData.name ??
+                  input.manager.userData.fullName,
+              ),
+            ),
+            last_name: lastName(
+              text(
+                payroll.managerName ??
+                  input.manager.userData.name ??
+                  input.manager.userData.fullName,
+              ),
+            ),
+          },
+        },
+      );
+    } else if (
+      payoutMethod === "bank" ||
+      payoutMethod === "bank_transfer" ||
+      payoutMethod === "banktransfer"
+    ) {
+      const bankUuid = text(
+        input.body.bankUuid ??
+          input.body.bank_uuid ??
+          payoutAccount.bankUuid,
+      );
+      const accountName = text(
+        input.body.bankAccountName ??
+          input.body.bank_account_name ??
+          payoutAccount.accountName ??
+          payroll.managerName ??
+          input.manager.userData.name ??
+          input.manager.userData.fullName,
+      );
+      const accountNumber = text(
+        input.body.bankAccountNumber ??
+          input.body.bank_account_number ??
+          payoutAccount.accountNumber,
+      );
+
+      if (!bankUuid) {
+        throw new Error("bankUuid is required for bank-transfer payout.");
+      }
+      if (!accountName) {
+        throw new Error("Bank account name is required.");
+      }
+      if (!accountNumber) {
+        throw new Error("Bank account number is required.");
+      }
+
+      providerResult = await payChanguRequest(
+        "/direct-charge/payouts/initialize",
+        {
+          method: "POST",
+          body: {
+            payout_method: "bank_transfer",
+            bank_uuid: bankUuid,
+            amount: amount.toFixed(2),
+            charge_id: chargeId,
+            bank_account_name: accountName,
+            bank_account_number: accountNumber,
+            ...(text(input.body.email)
+              ? { email: text(input.body.email) }
+              : {}),
+            first_name: firstName(accountName),
+            last_name: lastName(accountName),
+          },
+        },
+      );
+    } else {
+      throw new Error(
+        "Unsupported payout method. Use mobile_money or bank_transfer.",
+      );
+    }
+
+    if (!providerResult.response.ok) {
+      throw new Error(
+        `PayChangu payout initialization failed with HTTP ${providerResult.response.status}: ${safeJson(providerResult.data)}`,
+      );
+    }
+
+    const providerCharge = providerChargeId(providerResult.data) || chargeId;
+    const status = payrollPayoutStatus(providerResult.data);
+
+    // Payout initialization means the provider accepted/submitted
+    // the request. It does not prove that the recipient received money.
+    const paid = false;
+
+    await payoutRef.set(
+      {
+        provider: "paychangu",
+        providerChargeId: providerCharge,
+        providerStatus: status || "pending",
+        providerResponse: providerResult.data,
+        status: paid ? "PAID" : "PROCESSING",
+        paidAt: paid ? FieldValue.serverTimestamp() : null,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    await db
+      .collection("manager_payroll")
+      .doc(input.payrollId)
+      .set(
+        {
+          payoutId: payoutRef.id,
+          payoutChargeId: providerCharge,
+          payoutStatus: paid ? "PAID" : "PROCESSING",
+          payoutProvider: "paychangu",
+          payoutProviderStatus: status || "pending",
+          payoutRequestedAt: FieldValue.serverTimestamp(),
+          ...(paid
+            ? { paidAt: FieldValue.serverTimestamp() }
+            : {}),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+    return {
+      payoutId: payoutRef.id,
+      payrollId: input.payrollId,
+      chargeId: providerCharge,
+      amount,
+      currency,
+      payoutMethod,
+      status: paid ? "PAID" : "PROCESSING",
+      providerStatus: status || "pending",
+      providerResponse: providerResult.data,
+    };
+  } catch (error) {
+    await payoutRef.set(
+      {
+        status: "FAILED",
+        failureReason:
+          error instanceof Error ? error.message : String(error),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    throw error;
+  }
+}
+
+app.post(
+  "/admin/manager-payroll/:payrollId/approve",
+  async (req: Request, res: Response) => {
+    try {
+      const admin = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+      const payrollId = text(req.params.payrollId);
+      if (!payrollId) {
+        return res.status(400).json({
+          success: false,
+          error: "Payroll ID is required.",
+        });
+      }
+
+      const payrollRef = db.collection("manager_payroll").doc(payrollId);
+      const snap = await payrollRef.get();
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Manager payroll record not found.",
+        });
+      }
+
+      const data = snap.data() ?? {};
+      const status = text(data.status).toLowerCase();
+      if (status === "paid") {
+        return res.status(409).json({
+          success: false,
+          error: "Payroll has already been paid.",
+        });
+      }
+
+      await payrollRef.set(
+        {
+          status: "Approved",
+          approvedForPayment: true,
+          approvedBy: admin.uid,
+          approvedByEmail: admin.email,
+          approvedAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        payrollId,
+        status: "Approved",
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.get(
+  "/admin/manager-payroll/:payrollId/payout/preflight",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+
+      const payrollId = text(req.params.payrollId);
+
+      if (!payrollId) {
+        return res.status(400).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error: "Payroll ID is required.",
+        });
+      }
+
+      const payrollSnap = await db
+        .collection("manager_payroll")
+        .doc(payrollId)
+        .get();
+
+      if (!payrollSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error: "Manager payroll record not found.",
+        });
+      }
+
+      const payroll = payrollSnap.data() ?? {};
+      const payrollStatus = text(payroll.status).toLowerCase();
+
+      if (
+        payrollStatus !== "approved" ||
+        payroll.approvedForPayment !== true
+      ) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Payroll is not approved and ready for payment.",
+          payrollStatus: payroll.status ?? null,
+          approvedForPayment:
+            payroll.approvedForPayment === true,
+        });
+      }
+
+      const managerUid = text(
+        payroll.managerUid ??
+          payroll.managerUID ??
+          payroll.uid,
+      );
+
+      if (!managerUid) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error: "Manager UID is missing from payroll.",
+        });
+      }
+
+      const managerSnap = await db
+        .collection("users")
+        .doc(managerUid)
+        .get();
+
+      if (!managerSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error: "Manager account was not found.",
+        });
+      }
+
+      const managerData = managerSnap.data() ?? {};
+
+      const payoutAccountSnap = await db
+        .collection("manager_payout_accounts")
+        .doc(managerUid)
+        .get();
+
+      if (!payoutAccountSnap.exists) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Manager payout account is not configured.",
+        });
+      }
+
+      const payoutAccount =
+        payoutAccountSnap.data() ?? {};
+
+      const payoutAccountStatus =
+        text(payoutAccount.status).toUpperCase();
+
+      if (payoutAccountStatus !== "VERIFIED") {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Manager payout account must be VERIFIED before payout.",
+          payoutAccountStatus:
+            payoutAccount.status ?? "PENDING",
+        });
+      }
+
+      const currency = normalizeCurrency(
+        payroll.currency ??
+          managerData.currency ??
+          payoutAccount.currency ??
+          "MWK",
+      );
+
+      const amount = payrollPayoutAmount(payroll);
+
+      if (amount <= 0) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Payroll payable amount must be greater than zero.",
+        });
+      }
+
+      if (currency !== "MWK") {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Live payroll payout is currently enabled only for MWK in this MobiFlex PayChangu integration.",
+          currency,
+        });
+      }
+
+      assertPayChanguConfigured();
+
+      const walletBalance =
+        await getPayChanguWalletBalance(currency);
+
+      if (
+        walletBalance.environment &&
+        walletBalance.environment.toLowerCase() !== "live"
+      ) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "PayChangu wallet is not in live environment.",
+          environment:
+            walletBalance.environment,
+        });
+      }
+
+      if (
+        walletBalance.currency &&
+        walletBalance.currency !== currency
+      ) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "PayChangu wallet currency mismatch.",
+          walletCurrency:
+            walletBalance.currency,
+          currency,
+        });
+      }
+
+      if (
+        walletBalance.mainBalance + 0.0001 <
+        amount
+      ) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Insufficient PayChangu main balance for payroll payout.",
+          requiredAmount: amount,
+          availableBalance:
+            walletBalance.mainBalance,
+          currency,
+        });
+      }
+
+      const payoutMethod =
+        text(payoutAccount.method).toLowerCase();
+
+      if (!payoutMethod) {
+        return res.status(409).json({
+          success: false,
+          ready: false,
+          payoutWillSubmit: false,
+          error:
+            "Payout method is required.",
+        });
+      }
+
+      if (
+        payoutMethod === "mobile_money" ||
+        payoutMethod === "mobilemoney" ||
+        payoutMethod === "momo"
+      ) {
+        const operator = normalizeOperator(
+          payoutAccount.operator ??
+            payoutAccount.providerName,
+        );
+
+        if (!operator) {
+          return res.status(409).json({
+            success: false,
+            ready: false,
+            payoutWillSubmit: false,
+            error:
+              "Airtel or TNM operator is required.",
+          });
+        }
+
+        await resolvePayChanguOperator(operator);
+
+        const mobile = cleanMalawiMobile(
+          payoutAccount.phoneNumber ??
+            payoutAccount.phone,
+        );
+
+        if (!/^\+265[89][0-9]{7,8}$/.test(mobile)) {
+          return res.status(409).json({
+            success: false,
+            ready: false,
+            payoutWillSubmit: false,
+            error:
+              "A valid Malawi mobile-money number is required.",
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          ready: true,
+          payoutWillSubmit: false,
+          payrollId,
+          managerUid,
+          currency,
+          amount,
+          payoutMethod: "mobile_money",
+          operator,
+          mobile,
+          payoutAccountStatus,
+          walletEnvironment:
+            walletBalance.environment ?? null,
+          walletCurrency:
+            walletBalance.currency ?? currency,
+          availableBalance:
+            walletBalance.mainBalance,
+          message:
+            "Payroll payout preflight passed. No payout was submitted.",
+        });
+      }
+
+      if (
+        payoutMethod === "bank" ||
+        payoutMethod === "bank_transfer" ||
+        payoutMethod === "banktransfer"
+      ) {
+        const bankUuid = text(
+          payoutAccount.bankUuid ??
+            payoutAccount.bank_uuid,
+        );
+
+        const accountName = text(
+          payoutAccount.accountName ??
+            managerData.name ??
+            managerData.fullName,
+        );
+
+        const accountNumber = text(
+          payoutAccount.accountNumber,
+        );
+
+        if (!bankUuid) {
+          return res.status(409).json({
+            success: false,
+            ready: false,
+            payoutWillSubmit: false,
+            error:
+              "Bank UUID is required for bank payout.",
+          });
+        }
+
+        if (!accountName) {
+          return res.status(409).json({
+            success: false,
+            ready: false,
+            payoutWillSubmit: false,
+            error:
+              "Bank account name is required.",
+          });
+        }
+
+        if (!accountNumber) {
+          return res.status(409).json({
+            success: false,
+            ready: false,
+            payoutWillSubmit: false,
+            error:
+              "Bank account number is required.",
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          ready: true,
+          payoutWillSubmit: false,
+          payrollId,
+          managerUid,
+          currency,
+          amount,
+          payoutMethod: "bank_transfer",
+          bankUuid,
+          accountName,
+          payoutAccountStatus,
+          walletEnvironment:
+            walletBalance.environment ?? null,
+          walletCurrency:
+            walletBalance.currency ?? currency,
+          availableBalance:
+            walletBalance.mainBalance,
+          message:
+            "Payroll payout preflight passed. No payout was submitted.",
+        });
+      }
+
+      return res.status(409).json({
+        success: false,
+        ready: false,
+        payoutWillSubmit: false,
+        error:
+          "Unsupported payout method. Use mobile_money or bank_transfer.",
+        payoutMethod,
+      });
+    } catch (error) {
+      console.error(
+        "Manager payroll payout preflight error:",
+        error,
+      );
+
+      return res.status(500).json({
+        success: false,
+        ready: false,
+        payoutWillSubmit: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Payroll payout preflight failed.",
+      });
+    }
+  },
+);
+app.post(
+  "/admin/manager-payroll/:payrollId/payout",
+  async (req: Request, res: Response) => {
+    try {
+      const admin = await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+      const payrollId = text(req.params.payrollId);
+      const payrollRef = db.collection("manager_payroll").doc(payrollId);
+      const snap = await payrollRef.get();
+
+      if (!snap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Manager payroll record not found.",
+        });
+      }
+
+      const payroll = snap.data() ?? {};
+      const status = text(payroll.status).toLowerCase();
+      const payoutStatus = text(payroll.payoutStatus).toUpperCase();
+
+      if (status !== "approved" || payroll.approvedForPayment !== true) {
+        return res.status(409).json({
+          success: false,
+          error: "Super Admin must approve this payroll before payout.",
+        });
+      }
+
+      if (payoutStatus === "PAID") {
+        return res.status(409).json({
+          success: false,
+          error: "This payroll has already been paid.",
+        });
+      }
+
+      if (payoutStatus === "PROCESSING") {
+        return res.status(409).json({
+          success: false,
+          error: "A payout is already processing for this payroll.",
+        });
+      }
+
+      const managerUid = text(payroll.managerUid);
+      if (!managerUid) {
+        return res.status(400).json({
+          success: false,
+          error: "Payroll managerUid is missing.",
+        });
+      }
+
+      const managerSnap = await db.collection("users").doc(managerUid).get();
+      if (!managerSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Manager account was not found.",
+        });
+      }
+
+      const managerData = managerSnap.data() ?? {};
+      const result = await initiateManagerPayrollPayout({
+        payrollId,
+        payroll,
+        manager: {
+          uid: managerUid,
+          email: text(managerData.email ?? payroll.managerEmail),
+          userData: managerData,
+        },
+        body: req.body ?? {},
+      });
+
+      await payrollRef.set(
+        {
+          payoutRequestedBy: admin.uid,
+          payoutRequestedByEmail: admin.email,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      return res.status(200).json({
+        success: true,
+        ...result,
+      });
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+
+app.get(
+  "/admin/manager-payroll/:payrollId/payout/status",
+  async (req: Request, res: Response) => {
+    try {
+      await verifyStaff(req, [
+        "super admin",
+        "superadmin",
+        "super administrator",
+      ]);
+      const payrollId = text(req.params.payrollId);
+      const payrollSnap = await db
+        .collection("manager_payroll")
+        .doc(payrollId)
+        .get();
+
+      if (!payrollSnap.exists) {
+        return res.status(404).json({
+          success: false,
+          error: "Manager payroll record not found.",
+        });
+      }
+
+      const payroll = payrollSnap.data() ?? {};
+      const payoutId = text(payroll.payoutId);
+      if (!payoutId) {
+        return res.status(200).json({
+          success: true,
+          payrollId,
+          payoutStatus: text(payroll.payoutStatus) || "NOT_REQUESTED",
+        });
+      }
+
+      const payoutSnap = await db
+        .collection("manager_payroll_payouts")
+        .doc(payoutId)
+        .get();
+      const payout = payoutSnap.data() ?? {};
+
+      return res.status(200).json({
+        success: true,
+        payrollId,
+        payoutId,
+        status: text(payout.status || payroll.payoutStatus || "UNKNOWN"),
+        providerStatus: text(payout.providerStatus),
+        chargeId: text(payout.providerChargeId || payout.chargeId),
+        amount: money(payout.amount || payrollPayoutAmount(payroll)),
+        currency: text(payout.currency || payroll.currency || "MWK"),
+      });
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  },
+);
+app.use(
+  (
+    error: unknown,
+    _req: Request,
+    res: Response,
+    _next: NextFunction,
+  ) => {
+    console.error(
+      "Unhandled server error:",
+      error,
+    );
+
+    if (res.headersSent) {
+      return;
+    }
+
+    res.status(500).json({
+      success: false,
+
+      message:
+        "Internal server error.",
+
+      details:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    });
+  },
+);
+
+/* ============================================================
+   MANAGER COMMISSION SCHEDULER - REAL DAILY PROCESSOR
+   ------------------------------------------------------------
+   Runs every minute and processes manager commissions when the
+   manager's configured country reaches 20:30 local time.
+
+   IMPORTANT:
+   - This prepares manager payroll for payout.
+   - It does NOT bypass Super Admin approval.
+   - It does NOT bypass verified payout-account checks.
+   - It does NOT directly send real money.
+   - Commission documents are moved from PENDING to
+     READY_FOR_PAYOUT only after they are attached to payroll.
+   ============================================================ */
+
+const MANAGER_COMMISSION_CRON = "* * * * *";
+const MANAGER_COMMISSION_CHUNK_SIZE = 350;
+
+const MANAGER_COMMISSION_TIMEZONES_BY_CODE: Record<
+  string,
+  string
+> = {
+  MW: "Africa/Blantyre",
+  ZM: "Africa/Lusaka",
+  TZ: "Africa/Dar_es_Salaam",
+  KE: "Africa/Nairobi",
+  UG: "Africa/Kampala",
+  RW: "Africa/Kigali",
+  BI: "Africa/Bujumbura",
+  ZA: "Africa/Johannesburg",
+  ZW: "Africa/Harare",
+  MZ: "Africa/Maputo",
+  BW: "Africa/Gaborone",
+  NA: "Africa/Windhoek",
+  NG: "Africa/Lagos",
+  GH: "Africa/Accra",
+  ET: "Africa/Addis_Ababa",
+  EG: "Africa/Cairo",
+  MU: "Indian/Mauritius",
+  SC: "Indian/Mahe",
+  CD: "Africa/Kinshasa",
+  AO: "Africa/Luanda",
+  SN: "Africa/Dakar",
+  CI: "Africa/Abidjan",
+};
+
+const MANAGER_COMMISSION_TIMEZONES_BY_COUNTRY: Record<
+  string,
+  string
+> = {
+  malawi: "Africa/Blantyre",
+  zambia: "Africa/Lusaka",
+  tanzania: "Africa/Dar_es_Salaam",
+  kenya: "Africa/Nairobi",
+  uganda: "Africa/Kampala",
+  rwanda: "Africa/Kigali",
+  burundi: "Africa/Bujumbura",
+  "south africa": "Africa/Johannesburg",
+  zimbabwe: "Africa/Harare",
+  mozambique: "Africa/Maputo",
+  botswana: "Africa/Gaborone",
+  namibia: "Africa/Windhoek",
+  nigeria: "Africa/Lagos",
+  ghana: "Africa/Accra",
+  ethiopia: "Africa/Addis_Ababa",
+  egypt: "Africa/Cairo",
+  mauritius: "Indian/Mauritius",
+  seychelles: "Indian/Mahe",
+  "democratic republic of the congo":
+    "Africa/Kinshasa",
+  "democratic republic of congo":
+    "Africa/Kinshasa",
+  drc: "Africa/Kinshasa",
+  angola: "Africa/Luanda",
+  senegal: "Africa/Dakar",
+  "ivory coast": "Africa/Abidjan",
+  "cote d'ivoire": "Africa/Abidjan",
+};
+
+function managerCommissionTimezone(
+  data: DocumentData,
+): string {
+  const countryCode = text(data.countryCode)
+    .trim()
+    .toUpperCase();
+
+  if (
+    countryCode &&
+    MANAGER_COMMISSION_TIMEZONES_BY_CODE[countryCode]
+  ) {
+    return MANAGER_COMMISSION_TIMEZONES_BY_CODE[
+      countryCode
+    ];
+  }
+
+  const country = text(data.country)
+    .trim()
+    .toLowerCase();
+
+  return (
+    MANAGER_COMMISSION_TIMEZONES_BY_COUNTRY[country] ??
+    "Africa/Blantyre"
+  );
+}
+
+function managerCommissionLocalParts(
+  date: Date,
+  timeZone: string,
+): {
+  year: string;
+  month: string;
+  day: string;
+  hour: number;
+  minute: number;
+  dateKey: string;
+} {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+
+  const values: Record<string, string> = {};
+
+  for (const part of parts) {
+    if (part.type !== "literal") {
+      values[part.type] = part.value;
+    }
+  }
+
+  const year = values.year ?? "1970";
+  const month = values.month ?? "01";
+  const day = values.day ?? "01";
+
+  return {
+    year,
+    month,
+    day,
+    hour: Number(values.hour ?? "-1"),
+    minute: Number(values.minute ?? "-1"),
+    dateKey: `${year}-${month}-${day}`,
+  };
+}
+
+type ManagerCommissionSchedulerGroup = {
+  managerUid: string;
+  managerName: string;
+  managerEmail: string;
+  country: string;
+  countryCode: string;
+  currency: string;
+  timezone: string;
+  localDate: string;
+  commissionDocs: QueryDocumentSnapshot[];
+};
+
+async function processManagerCommissionGroup(
+  group: ManagerCommissionSchedulerGroup,
+): Promise<{
+  addedAmount: number;
+  commissionCount: number;
+}> {
+  const payrollId = [
+    "daily_commission",
+    group.managerUid,
+    group.localDate,
+    group.currency.toLowerCase(),
+  ].join("_");
+
+  const payrollRef = db
+    .collection("manager_payroll")
+    .doc(payrollId);
+
+  let totalAdded = 0;
+  let totalCount = 0;
+
+  for (
+    let index = 0;
+    index < group.commissionDocs.length;
+    index += MANAGER_COMMISSION_CHUNK_SIZE
+  ) {
+    const chunk = group.commissionDocs.slice(
+      index,
+      index + MANAGER_COMMISSION_CHUNK_SIZE,
+    );
+
+    const result = await db.runTransaction(async (tx) => {
+      const payrollSnap = await tx.get(payrollRef);
+
+      const commissionSnaps: DocumentSnapshot[] = [];
+
+      for (const commissionDoc of chunk) {
+        const snap = await tx.get(commissionDoc.ref);
+        commissionSnaps.push(snap);
+      }
+
+      const eligible = commissionSnaps.filter((snap) => {
+        if (!snap.exists) {
+          return false;
+        }
+
+        const data = snap.data() ?? {};
+
+        const status = text(data.status)
+          .trim()
+          .toUpperCase();
+
+        const managerUid = text(data.managerUid).trim();
+        const amount = money(data.amount);
+        const currency = normalizeCurrency(
+          data.currency ?? group.currency,
+        );
+
+        return (
+          status === "PENDING" &&
+          managerUid === group.managerUid &&
+          amount > 0 &&
+          currency === group.currency
+        );
+      });
+
+      if (eligible.length === 0) {
+        return {
+          addedAmount: 0,
+          commissionCount: 0,
+        };
+      }
+
+      const existingPayrollData = payrollSnap.exists
+        ? payrollSnap.data() ?? {}
+        : {};
+
+      const existingStatus = text(
+        existingPayrollData.status,
+      )
+        .trim()
+        .toUpperCase();
+
+      const finalizedStatuses = new Set([
+        "PAID",
+        "PAYOUT_SUBMITTED",
+        "PROCESSING",
+        "COMPLETED",
+      ]);
+
+      if (
+        payrollSnap.exists &&
+        finalizedStatuses.has(existingStatus)
+      ) {
+        return {
+          addedAmount: 0,
+          commissionCount: 0,
+        };
+      }
+
+      let addedAmount = 0;
+
+      for (const snap of eligible) {
+        const data = snap.data() ?? {};
+        addedAmount += money(data.amount);
+      }
+
+      const existingCommissionTotal = money(
+        existingPayrollData.commissionTotal,
+      );
+
+      const existingCommissionCount = Math.max(
+        0,
+        Number(
+          existingPayrollData.commissionCount ?? 0,
+        ),
+      );
+
+      const nextCommissionTotal = money(
+        existingCommissionTotal + addedAmount,
+      );
+
+      const nextCommissionCount =
+        existingCommissionCount + eligible.length;
+
+      const existingApprovedForPayment =
+        existingPayrollData.approvedForPayment === true;
+
+      const nextStatus = existingApprovedForPayment
+        ? "PENDING_APPROVAL"
+        : text(existingPayrollData.status).trim() ||
+          "PENDING_APPROVAL";
+
+      tx.set(
+        payrollRef,
+        {
+          payrollId,
+          payrollType: "DAILY_COMMISSION",
+          source: "MANAGER_APPROVED_APPLICATION",
+          managerUid: group.managerUid,
+          managerName: group.managerName,
+          managerEmail: group.managerEmail,
+          country: group.country,
+          countryCode: group.countryCode,
+          currency: group.currency,
+          timezone: group.timezone,
+
+          periodLabel:
+            `Manager Commission - ${group.localDate}`,
+
+          commissionDate: group.localDate,
+          commissionSchedule: "DAILY",
+          commissionPayoutLocalTime: "20:30",
+
+          basicSalary: 0,
+          allowances: 0,
+          deductions: 0,
+          netSalary: 0,
+
+          commissionTotal: nextCommissionTotal,
+          commissionCount: nextCommissionCount,
+          totalEarnings: nextCommissionTotal,
+
+          status: nextStatus,
+          approvedForPayment:
+            existingApprovedForPayment
+              ? false
+              : existingPayrollData.approvedForPayment === true,
+
+          payoutManagerUid: group.managerUid,
+          payoutAccountRequired: true,
+
+          commissionProcessor:
+            "REAL_DAILY_MANAGER_COMMISSION_SCHEDULER",
+          commissionProcessorVersion: "1.0.0",
+
+          createdAt:
+            existingPayrollData.createdAt ??
+            FieldValue.serverTimestamp(),
+
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        {
+          merge: true,
+        },
+      );
+
+      for (const snap of eligible) {
+        tx.set(
+          snap.ref,
+          {
+            status: "READY_FOR_PAYOUT",
+            payrollId,
+            payoutStatus: "PENDING_APPROVAL",
+            payoutManagerUid: group.managerUid,
+            payoutAccountRequired: true,
+            payrollProcessedAt:
+              FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          {
+            merge: true,
+          },
+        );
+      }
+
+      return {
+        addedAmount,
+        commissionCount: eligible.length,
+      };
+    });
+
+    totalAdded = money(totalAdded + result.addedAmount);
+    totalCount += result.commissionCount;
+  }
+
+  return {
+    addedAmount: totalAdded,
+    commissionCount: totalCount,
+  };
+}
+
+let managerCommissionSchedulerRunning = false;
+let managerCommissionSchedulerStarted = false;
+
+async function processDueManagerCommissions(): Promise<void> {
+  if (managerCommissionSchedulerRunning) {
+    return;
+  }
+
+  managerCommissionSchedulerRunning = true;
+
+  try {
+    const now = new Date();
+
+    const pendingSnapshot = await db
+      .collection("manager_commissions")
+      .where("status", "==", "PENDING")
+      .limit(1000)
+      .get();
+
+    if (pendingSnapshot.empty) {
+      return;
+    }
+
+    const groups = new Map<
+      string,
+      ManagerCommissionSchedulerGroup
+    >();
+
+    for (const commissionDoc of pendingSnapshot.docs) {
+      const data = commissionDoc.data();
+
+      const managerUid = text(data.managerUid).trim();
+      const amount = money(data.amount);
+
+      if (!managerUid || amount <= 0) {
+        continue;
+      }
+
+      const timezone =
+        managerCommissionTimezone(data);
+
+      let local;
+
+      try {
+        local = managerCommissionLocalParts(
+          now,
+          timezone,
+        );
+      } catch {
+        continue;
+      }
+
+      /*
+       * Normal target is exactly 20:30.
+       *
+       * 20:30 - 20:34 is a small restart/retry window.
+       * Firestore idempotency prevents duplicate processing.
+       */
+      const isDue =
+        local.hour === 20 &&
+        local.minute >= 30 &&
+        local.minute <= 34;
+
+      if (!isDue) {
+        continue;
+      }
+
+      const currency = normalizeCurrency(
+        data.currency ?? "MWK",
+      );
+
+      const country = text(
+        data.country ?? "",
+      );
+
+      const countryCode = text(
+        data.countryCode ?? "",
+      )
+        .trim()
+        .toUpperCase();
+
+      const managerName =
+        text(
+          data.managerName ??
+            data.managerFullName ??
+            managerUid,
+        ) || managerUid;
+
+      const managerEmail = text(
+        data.managerEmail ?? "",
+      );
+
+      const groupKey = [
+        managerUid,
+        currency,
+        timezone,
+        local.dateKey,
+      ].join("|");
+
+      const existing = groups.get(groupKey);
+
+      if (existing) {
+        existing.commissionDocs.push(
+          commissionDoc,
+        );
+        continue;
+      }
+
+      groups.set(groupKey, {
+        managerUid,
+        managerName,
+        managerEmail,
+        country,
+        countryCode,
+        currency,
+        timezone,
+        localDate: local.dateKey,
+        commissionDocs: [commissionDoc],
+      });
+    }
+
+    for (const group of groups.values()) {
+      const result =
+        await processManagerCommissionGroup(
+          group,
+        );
+
+      if (result.commissionCount > 0) {
+        console.log(
+          `[MANAGER COMMISSION] ${group.managerUid} ` +
+            `${group.localDate} ${group.timezone} ` +
+            `=> ${result.commissionCount} commissions, ` +
+            `${result.addedAmount} ${group.currency} ` +
+            `prepared for payout approval.`,
+        );
+      }
+    }
+
+    if (pendingSnapshot.size >= 1000) {
+      console.warn(
+        "[MANAGER COMMISSION] Pending commission query " +
+          "reached the 1000-document safety limit. " +
+          "Remaining commissions will be handled on the next run.",
+      );
+    }
+  } catch (error) {
+    console.error(
+      "[MANAGER COMMISSION] Scheduler run failed:",
+      error,
+    );
+  } finally {
+    managerCommissionSchedulerRunning = false;
+  }
+}
+
+function startManagerCommissionScheduler(): void {
+  if (managerCommissionSchedulerStarted) {
+    return;
+  }
+
+  managerCommissionSchedulerStarted = true;
+
+  nodeCron.schedule(
+    MANAGER_COMMISSION_CRON,
+    () => {
+      void processDueManagerCommissions();
+    },
+  );
+
+  console.log(
+    "[MANAGER COMMISSION] Scheduler ACTIVE.",
+  );
+
+  console.log(
+    "[MANAGER COMMISSION] Daily target: 20:30 local time per manager country/timezone.",
+  );
+
+  console.log(
+    "[MANAGER COMMISSION] Mode: PREPARE PAYROLL -> SUPER ADMIN APPROVAL -> REAL PAYOUT.",
+  );
+
+  /*
+   * Startup catch-up:
+   * If the backend starts during the 20:30-20:34 window,
+   * processDueManagerCommissions() can still catch the
+   * current day's commission batch.
+   */
+  void processDueManagerCommissions();
+}
+
+/* ============================================================
+   END MANAGER COMMISSION SCHEDULER
+   ============================================================ */
+if (require.main === module) {
+  app.listen(
+    PORT,
+    () => {
+      console.log("");
+
+      console.log(
+        "==============================================",
+      );
+
+      console.log(
+        " MobiFlex African Backend",
+      );
+
+      console.log(
+        " REAL MONEY + APPLICATION WORKFLOW MODE",
+      );
+
+      console.log(
+        "==============================================",
+      );
+
+      console.log(
+        `Server: http://localhost:${PORT}`,
+      );
+
+      console.log(
+        `Firebase: ${PROJECT_ID}`,
+      );
+
+      console.log(
+        `PayChangu: ${PAYCHANGU_BASE_URL}`,
+      );
+
+      console.log(
+        `PayChangu secret: ${
+          PAYCHANGU_SECRET_KEY
+            ? "CONFIGURED"
+            : "MISSING"
+        }`,
+      );
+
+      console.log(
+        `Webhook secret: ${
+          PAYCHANGU_WEBHOOK_SECRET
+            ? "CONFIGURED"
+            : "MISSING"
+        }`,
+      );
+
+      console.log(
+        `Airtel operator ref: ${PAYCHANGU_AIRTEL_OPERATOR_REF_ID}`,
+      );
+
+      console.log(
+        `TNM operator ref: ${PAYCHANGU_TNM_OPERATOR_REF_ID}`,
+      );
+
+      console.log(
+        `Live only: ${PAYCHANGU_LIVE_ONLY}`,
+      );
+
+      console.log(
+        "Customer payment endpoint:",
+      );
+
+      console.log(
+        `POST http://localhost:${PORT}/payments/real/customer/mobile-money`,
+      );
+
+      console.log(
+        "Customer verification endpoint:",
+      );
+
+      console.log(
+        `GET http://localhost:${PORT}/payments/real/customer/verify/:paymentId`,
+      );
+
+      console.log(
+        "PayChangu webhook endpoint:",
+      );
+
+      console.log(
+        `POST http://localhost:${PORT}/webhooks/paychangu`,
+      );
+
+      console.log(
+        "==============================================",
+      );
+      startManagerCommissionScheduler();
+    },
+  );
+}
+
+export { app };
+
