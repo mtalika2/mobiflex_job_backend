@@ -21,8 +21,10 @@ const nodeCron =
 
 import {
   applicationDefault,
+  cert,
   getApps,
   initializeApp,
+  type ServiceAccount,
 } from "firebase-admin/app";
 
 import {
@@ -244,10 +246,31 @@ const PAYCHANGU_CHECKOUT_RETURN_URL =
 // ============================================================
 
 if (getApps().length === 0) {
-  initializeApp({
-    credential: applicationDefault(),
-    projectId: PROJECT_ID,
-  });
+  const serviceAccountJson =
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+
+  if (serviceAccountJson) {
+    let serviceAccount: ServiceAccount;
+
+    try {
+      serviceAccount =
+        JSON.parse(serviceAccountJson) as ServiceAccount;
+    } catch {
+      throw new Error(
+        "FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON.",
+      );
+    }
+
+    initializeApp({
+      credential: cert(serviceAccount),
+      projectId: PROJECT_ID,
+    });
+  } else {
+    initializeApp({
+      credential: applicationDefault(),
+      projectId: PROJECT_ID,
+    });
+  }
 }
 
 const db = getFirestore();
@@ -22242,6 +22265,7 @@ function startManagerCommissionScheduler(): void {
 if (require.main === module) {
   app.listen(
     PORT,
+    "0.0.0.0",
     () => {
       console.log("");
 
@@ -22334,6 +22358,8 @@ if (require.main === module) {
 }
 
 export { app };
+
+
 
 
 
